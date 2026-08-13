@@ -8,7 +8,7 @@ from datetime import datetime, timedelta, timezone
 from discord.ext import commands
 
 
-DATA_FILE   = "channels.json"
+DATA_FILE = "/data/channels.json"
 
 CYCLE_HOURS = 5         # every 5 hours
 
