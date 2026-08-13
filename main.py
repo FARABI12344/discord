@@ -2,32 +2,28 @@ import os
 import asyncio
 
 import discord
-from discord.ext import commands, tasks
+from discord.ext import commands
 
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-TOKEN_FILE = "token.txt"
+TOKEN = os.getenv("DISCORD_TOKEN")
+
 COGS_FOLDER = "./cogs"
 COMMAND_PREFIX = ","
 
 
 # ============================================================
-# READ TOKEN
+# CHECK RAILWAY TOKEN
 # ============================================================
 
-if not os.path.isfile(TOKEN_FILE):
-    raise FileNotFoundError(
-        f"{TOKEN_FILE} was not found. Create it and put your token inside."
-    )
-
-with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-    TOKEN = f.read().strip()
-
 if not TOKEN:
-    raise ValueError(f"{TOKEN_FILE} is empty.")
+    raise RuntimeError(
+        "DISCORD_TOKEN environment variable is missing. "
+        "Add it in Railway → Variables."
+    )
 
 
 # ============================================================
@@ -39,6 +35,8 @@ bot = commands.Bot(
     self_bot=True,
 )
 
+cogs_loaded = False
+
 
 # ============================================================
 # ONLY RESPOND TO YOUR OWN COMMANDS
@@ -46,10 +44,10 @@ bot = commands.Bot(
 
 @bot.check
 async def only_me(ctx):
-    if bot.user is None:
-        return False
-
-    return ctx.author.id == bot.user.id
+    return (
+        bot.user is not None
+        and ctx.author.id == bot.user.id
+    )
 
 
 # ============================================================
@@ -59,23 +57,17 @@ async def only_me(ctx):
 async def load_all_cogs():
     results = []
 
-    if not os.path.isdir(COGS_FOLDER):
-        os.makedirs(COGS_FOLDER, exist_ok=True)
-        results.append("📁 Created missing cogs folder.")
-        return results
+    os.makedirs(COGS_FOLDER, exist_ok=True)
 
-    files = sorted(os.listdir(COGS_FOLDER))
-
-    cog_files = [
+    cog_files = sorted(
         filename
-        for filename in files
+        for filename in os.listdir(COGS_FOLDER)
         if filename.endswith(".py")
         and not filename.startswith("__")
-    ]
+    )
 
     if not cog_files:
-        results.append("⚠️ No cogs found.")
-        return results
+        return ["⚠️ No cogs found."]
 
     for filename in cog_files:
         cog_name = f"cogs.{filename[:-3]}"
@@ -83,26 +75,14 @@ async def load_all_cogs():
         try:
             if cog_name in bot.extensions:
                 await bot.reload_extension(cog_name)
-                results.append(f"🔁 Reloaded: {filename}")
-
+                results.append(f"🔁 {filename}")
             else:
                 await bot.load_extension(cog_name)
-                results.append(f"✅ Loaded: {filename}")
-
-        except commands.ExtensionNotLoaded:
-            try:
-                await bot.load_extension(cog_name)
-                results.append(f"✅ Loaded: {filename}")
-
-            except Exception as e:
-                results.append(
-                    f"❌ Failed: {filename} | "
-                    f"{type(e).__name__}: {e}"
-                )
+                results.append(f"✅ {filename}")
 
         except Exception as e:
             results.append(
-                f"❌ Failed: {filename} | "
+                f"❌ {filename} | "
                 f"{type(e).__name__}: {e}"
             )
 
@@ -110,98 +90,81 @@ async def load_all_cogs():
 
 
 # ============================================================
-# HEARTBEAT
-# ============================================================
-
-@tasks.loop(seconds=25)
-async def heartbeat():
-    print("💓 heartbeat")
-
-
-@heartbeat.before_loop
-async def before_heartbeat():
-    await bot.wait_until_ready()
-
-
-# ============================================================
-# ON READY
+# READY EVENT
 # ============================================================
 
 @bot.event
 async def on_ready():
-    print("=" * 55)
-    print(f"✅ Logged in as: {bot.user}")
-    print(f"🆔 User ID: {bot.user.id}")
-    print("=" * 55)
+    global cogs_loaded
 
-    print("\n🔄 Loading cogs...\n")
+    print(f"✅ Logged in as {bot.user} ({bot.user.id})")
 
-    results = await load_all_cogs()
+    # on_ready can run multiple times after reconnecting.
+    # Only automatically load the cogs once.
+    if not cogs_loaded:
+        results = await load_all_cogs()
 
-    for result in results:
-        print(result)
+        for result in results:
+            print(result)
 
-    print("\n🚀 Client is ready.\n")
+        cogs_loaded = True
 
-    # Prevent:
-    # RuntimeError: Task is already launched and is not completed
-    if not heartbeat.is_running():
-        heartbeat.start()
+    print("🚀 Ready")
 
 
 # ============================================================
-# REFRESH COMMAND
+# REFRESH COGS
 # ============================================================
 
 @bot.command(name="refresh")
 async def refresh(ctx):
-    try:
-        msg = await ctx.send("🔄 Refreshing cogs...")
+    msg = await ctx.send("🔄 Refreshing...")
 
+    try:
         results = await load_all_cogs()
 
-        failed = [
-            result
+        failed = any(
+            result.startswith("❌")
             for result in results
-            if result.startswith("❌")
-        ]
+        )
 
-        # Retry failed cogs once
+        # Retry once if something failed
         if failed:
             await asyncio.sleep(1)
 
-            results.append("")
-            results.append("────── RETRY ──────")
+            retry = await load_all_cogs()
 
-            retry_results = await load_all_cogs()
-            results.extend(retry_results)
+            results += [
+                "",
+                "──── RETRY ────",
+                *retry
+            ]
 
         output = "\n".join(results)
 
-        # Discord message limit is 2000 characters.
-        if len(output) > 1850:
-            output = output[:1850]
-            output += "\n\n...output shortened"
+        # Stay below Discord's 2000 character limit
+        if len(output) > 1800:
+            output = output[:1800] + "\n...shortened"
 
         await msg.edit(
             content=f"```text\n{output}\n```"
         )
 
     except Exception as e:
+        error = f"{type(e).__name__}: {e}"
+
+        print(f"Refresh error: {error}")
+
         try:
-            await ctx.send(
-                f"⚠️ Refresh failed: "
-                f"{type(e).__name__}: {e}"
+            await msg.edit(
+                content=f"⚠️ Refresh failed: `{error}`"
             )
         except Exception:
-            print(
-                f"Refresh error: "
-                f"{type(e).__name__}: {e}"
-            )
+            pass
 
 
 # ============================================================
-# OPTIONAL TEST COMMAND
+# PING
 # ============================================================
 
 @bot.command(name="ping")
@@ -220,7 +183,7 @@ async def ping(ctx):
 @bot.event
 async def on_command_error(ctx, error):
 
-    # Ignore commands from anybody other than yourself
+    # Ignore commands from other users
     if isinstance(error, commands.CheckFailure):
         return
 
@@ -236,29 +199,31 @@ async def on_command_error(ctx, error):
 
     if isinstance(error, commands.BadArgument):
         await ctx.send(
-            f"⚠️ Invalid argument: {error}"
+            f"⚠️ Invalid argument: `{error}`"
         )
         return
 
     if isinstance(error, commands.CommandOnCooldown):
         await ctx.send(
-            f"⏳ Try again in {error.retry_after:.1f}s."
+            f"⏳ Try again in `{error.retry_after:.1f}s`."
         )
         return
 
-    # Get the real error if it's wrapped
     original = getattr(error, "original", error)
 
-    print(
-        f"⚠️ Command error in "
-        f"{getattr(ctx.command, 'name', 'unknown')}: "
+    error_text = (
         f"{type(original).__name__}: {original}"
+    )
+
+    print(
+        f"⚠️ Command error "
+        f"[{getattr(ctx.command, 'name', 'unknown')}]: "
+        f"{error_text}"
     )
 
     try:
         await ctx.send(
-            f"⚠️ Error: "
-            f"`{type(original).__name__}: {original}`"
+            f"⚠️ Error: `{error_text}`"
         )
 
     except Exception:
@@ -275,27 +240,27 @@ async def before_command(ctx):
 
 
 # ============================================================
-# MAIN
+# START
 # ============================================================
 
 def main():
-    print("🚀 Starting...")
+    print("🚀 Starting Discord client...")
 
     try:
         bot.run(TOKEN)
 
-    except KeyboardInterrupt:
-        print("\n🛑 Stopped manually.")
-
     except discord.LoginFailure:
         print(
-            "❌ Login failed. Check the token inside token.txt."
+            "❌ Login failed. Check DISCORD_TOKEN "
+            "in Railway Variables."
         )
+
+    except KeyboardInterrupt:
+        print("🛑 Stopped.")
 
     except Exception as e:
         print(
-            f"❌ Fatal error: "
-            f"{type(e).__name__}: {e}"
+            f"❌ Fatal: {type(e).__name__}: {e}"
         )
 
 
