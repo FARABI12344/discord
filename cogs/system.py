@@ -72,6 +72,8 @@ class AutoPromo(commands.Cog):
 
     async def _common_start(self, ctx: commands.Context, reverse: bool):
 
+        self.data = load_data()
+
         if not self.data.get("message"):
 
             return await ctx.send("⚠️  Set a message first with `,setm …`.")
