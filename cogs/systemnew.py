@@ -5,8 +5,7 @@ import json
 import os
 from datetime import datetime, timezone
 
-
-DATA_FILE = "channels.json"  # saved in project root
+DATA_FILE = "/data/channels.json"
 
 
 def load_data():
