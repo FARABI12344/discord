@@ -1,5 +1,6 @@
 # cogs/system.py
 
+
 import asyncio, json, os, discord
 
 from datetime import datetime, timedelta, timezone
@@ -30,14 +31,9 @@ def load_data() -> dict:
 
     if not os.path.exists(DATA_FILE):
 
-        return {
-            "message": "",
-            "channels": [],
-            "auto": False,
-            "next_run": None,
-            "log_channel": None,
-            "reverse": False
-        }
+        return {"message": "", "channels": [], "auto": False,
+
+                "next_run": None, "log_channel": None, "reverse": False}
 
     with open(DATA_FILE, encoding="utf8") as fp:
 
@@ -236,10 +232,9 @@ class AutoPromo(commands.Cog):
                 await log_ch.send(msg)
 
 
-        await log(
-            f"▶️ Cycle started ({'reverse' if self.data.get('reverse') else 'forward'}) "
-            f"— {len(order)} channels"
-        )
+        await log(f"▶️ Cycle started ({'reverse' if self.data.get('reverse') else 'forward'}) "
+
+                  f"— {len(order)} channels")
 
 
         for entry in order:
@@ -273,32 +268,23 @@ class AutoPromo(commands.Cog):
 
                     if attempt <= MAX_RETRIES:
 
-                        wait = max(
-                            RETRY_DELAY,
-                            int(getattr(e, "retry_after", RETRY_DELAY))
-                        )
+                        wait = max(RETRY_DELAY, int(getattr(e, "retry_after", RETRY_DELAY)))
 
-                        await log(
-                            f"⚠️ Rate-limit on {chan.guild.name}/#{chan.name} "
-                            f"– retry in {wait}s ({attempt}/{MAX_RETRIES+1})"
-                        )
+                        await log(f"⚠️ Rate-limit on {chan.guild.name}/#{chan.name} "
+
+                                  f"– retry in {wait}s ({attempt}/{MAX_RETRIES+1})")
 
                         await asyncio.sleep(wait)
 
                     else:
 
-                        await log(
-                            f"❌ Give-up {chan.guild.name}/#{chan.name}"
-                        )
+                        await log(f"❌ Give-up {chan.guild.name}/#{chan.name}")
 
                 except Exception as e:
 
-                    await log(
-                        f"❌ Error {chan.guild.name}/#{chan.name}: {e}"
-                    )
+                    await log(f"❌ Error {chan.guild.name}/#{chan.name}: {e}")
 
                     break
-
 
             await asyncio.sleep(SEND_DELAY)
 
