@@ -5,6 +5,7 @@ import json
 import re
 import difflib
 import unicodedata
+import asyncio
 import discord
 
 from discord.ext import commands
@@ -18,32 +19,109 @@ DATA_FILE = "/data/channels.json"
 
 PREFIX = ","
 
-# Strong patterns found repeatedly in your collab/promo channels.
+
+# ============================================================
+# CHANNEL-NAME PATTERNS
+# ============================================================
+
+# Strong patterns based on the channels you actually use.
 #
-# Exact/normalized matching is tried first.
-# difflib fuzzy matching is used afterward for similar spellings.
+# IMPORTANT:
+# The name alone is NOT enough anymore.
+# A channel must ALSO pass permissions + message-history checks.
 CHANNEL_PATTERNS = [
     "yours",
     "your",
     "urs",
-    "collabs",
-    "collab",
     "clbs",
     "clb",
+    "cllbs",
+    "collabs",
+    "collab",
+    "promos",
     "promo",
+    "sponsors",
     "sponsor",
     "sponsorship",
 ]
 
-# 0.82 = reasonably strict.
-#
-# Higher = fewer false positives.
-# Lower = finds more weird spellings, but may find random channels.
-FUZZY_THRESHOLD = 0.82
 
-# Don't let generated commands get too close to Discord's
-# 2000-character message limit.
+# ============================================================
+# FUZZY MATCH SETTINGS
+# ============================================================
+
+# Higher = stricter.
+#
+# 0.86 helps avoid weak matches such as completely unrelated
+# words while still catching small variations.
+FUZZY_THRESHOLD = 0.86
+
+
+# ============================================================
+# MESSAGE-HISTORY SETTINGS
+# ============================================================
+
+# Check up to this many recent messages from a candidate channel.
+RECENT_MESSAGE_LIMIT = 8
+
+
+# At least this many meaningful recent messages must exist.
+#
+# This prevents an empty/random channel from being accepted
+# because its name happened to contain "promo".
+MIN_RECENT_MESSAGES = 4
+
+
+# At least this many recent messages must contain a Discord
+# server invite.
+MIN_INVITE_MESSAGES = 3
+
+
+# 0.70 = at least 70% of recent meaningful messages should
+# look like actual server advertisements.
+MIN_INVITE_RATIO = 0.70
+
+
+# Small delay between HISTORY requests.
+#
+# This is not required for correctness, but scanning many
+# channels can generate many Discord API requests.
+HISTORY_DELAY = 0.20
+
+
+# ============================================================
+# OUTPUT
+# ============================================================
+
 MAX_COMMAND_LENGTH = 1850
+
+
+# ============================================================
+# DISCORD INVITE DETECTION
+# ============================================================
+
+# Examples accepted:
+#
+# https://discord.gg/abc123
+# http://discord.gg/abc123
+# discord.gg/abc123
+#
+# https://discord.com/invite/abc123
+# https://www.discord.com/invite/abc123
+#
+# https://discordapp.com/invite/abc123
+
+DISCORD_INVITE_REGEX = re.compile(
+    r"(?:https?://)?"
+    r"(?:www\.)?"
+    r"(?:"
+    r"discord\.gg/"
+    r"|"
+    r"discord(?:app)?\.com/invite/"
+    r")"
+    r"[A-Za-z0-9_-]+",
+    flags=re.IGNORECASE
+)
 
 
 # ============================================================
@@ -51,6 +129,7 @@ MAX_COMMAND_LENGTH = 1850
 # ============================================================
 
 def default_data():
+
     return {
         "message": "",
         "channels": [],
@@ -64,7 +143,9 @@ def default_data():
 def load_data():
 
     if not os.path.exists(DATA_FILE):
+
         return default_data()
+
 
     try:
 
@@ -77,13 +158,36 @@ def load_data():
             data = json.load(fp)
 
 
-        # Make sure expected fields exist
-        data.setdefault("message", "")
-        data.setdefault("channels", [])
-        data.setdefault("auto", False)
-        data.setdefault("next_run", None)
-        data.setdefault("log_channel", None)
-        data.setdefault("reverse", False)
+        data.setdefault(
+            "message",
+            ""
+        )
+
+        data.setdefault(
+            "channels",
+            []
+        )
+
+        data.setdefault(
+            "auto",
+            False
+        )
+
+        data.setdefault(
+            "next_run",
+            None
+        )
+
+        data.setdefault(
+            "log_channel",
+            None
+        )
+
+        data.setdefault(
+            "reverse",
+            False
+        )
+
 
         return data
 
@@ -91,7 +195,7 @@ def load_data():
     except Exception as e:
 
         print(
-            "[findnew] Failed loading channels.json:",
+            "[findnew] Failed loading data:",
             type(e).__name__,
             e
         )
@@ -100,41 +204,25 @@ def load_data():
 
 
 # ============================================================
-# NORMALIZE CHANNEL NAMES
+# NORMALIZE CHANNEL NAME
 # ============================================================
 
 def normalize_name(name: str) -> str:
-    """
-    Converts decorative Discord channel names into simpler text.
-
-    Examples:
-
-        "✿ㆍㆍclbs"
-            -> "clbs"
-
-        "﹒your﹒collabs"
-            -> "your collabs"
-
-        "♡⃕ㆍ𝕦r𝕤ㆍ"
-            -> "urs"
-
-    This makes pattern/fuzzy matching much more reliable.
-    """
 
     if not name:
+
         return ""
+
 
     try:
 
-        # Normalize Unicode characters
         text = unicodedata.normalize(
             "NFKC",
             str(name)
         ).casefold()
 
-        # Replace punctuation/decorative symbols with spaces.
-        #
-        # Keep letters and numbers.
+
+        # Decorative symbols become spaces
         text = re.sub(
             r"[^\w]+",
             " ",
@@ -142,63 +230,59 @@ def normalize_name(name: str) -> str:
             flags=re.UNICODE
         )
 
-        # Remove underscores too
-        text = text.replace("_", " ")
 
-        # Collapse repeated whitespace
+        text = text.replace(
+            "_",
+            " "
+        )
+
+
         text = re.sub(
             r"\s+",
             " ",
             text
         ).strip()
 
+
         return text
+
 
     except Exception:
 
-        return str(name).lower().strip()
+        return str(
+            name
+        ).lower().strip()
 
 
 # ============================================================
-# PATTERN MATCHING
+# CHANNEL NAME MATCH
 # ============================================================
 
 def channel_matches(name: str):
-    """
-    Returns:
 
-        (True, reason)
+    normalized = normalize_name(
+        name
+    )
 
-    or:
-
-        (False, None)
-
-    Matching methods:
-
-    1. Exact token
-    2. Direct substring
-    3. difflib fuzzy token matching
-    """
-
-    normalized = normalize_name(name)
 
     if not normalized:
+
         return False, None
 
 
-    # ========================================================
-    # TOKENIZE
-    # ========================================================
-
     tokens = [
+
         token
+
         for token in normalized.split()
+
         if len(token) >= 2
+
     ]
 
 
     # ========================================================
-    # 1. EXACT TOKEN MATCH
+    # 1. EXACT TOKEN
     # ========================================================
 
     for pattern in CHANNEL_PATTERNS:
@@ -212,20 +296,18 @@ def channel_matches(name: str):
 
 
     # ========================================================
-    # 2. DIRECT SUBSTRING MATCH
-    #
-    # Useful for names such as:
-    #
-    # "your-collabs"
-    # "collabs-only"
-    # "myclbs"
+    # 2. SUBSTRING
     # ========================================================
 
-    compact_name = normalized.replace(" ", "")
+    compact = normalized.replace(
+        " ",
+        ""
+    )
+
 
     for pattern in CHANNEL_PATTERNS:
 
-        if pattern in compact_name:
+        if pattern in compact:
 
             return (
                 True,
@@ -234,47 +316,42 @@ def channel_matches(name: str):
 
 
     # ========================================================
-    # 3. DIFFLIB FUZZY MATCH
-    #
-    # Example:
-    #
-    # "cllbs" -> "clbs"
-    # "collb" -> "collab"
-    # "sponsers" -> "sponsors"
+    # 3. DIFFLIB FUZZY
     # ========================================================
 
     for token in tokens:
 
-        # Don't compare giant text fragments
-        if len(token) > 25:
+        if len(token) > 20:
+
             continue
 
 
         for pattern in CHANNEL_PATTERNS:
 
-            # Very different lengths usually aren't useful.
+            # Don't compare wildly different lengths
             if abs(
-                len(token) - len(pattern)
-            ) > 4:
+                len(token)
+                - len(pattern)
+            ) > 3:
 
                 continue
 
 
-            similarity = difflib.SequenceMatcher(
+            ratio = difflib.SequenceMatcher(
                 None,
                 token,
                 pattern
             ).ratio()
 
 
-            if similarity >= FUZZY_THRESHOLD:
+            if ratio >= FUZZY_THRESHOLD:
 
                 return (
                     True,
                     (
-                        f"fuzzy:{token}"
-                        f"->{pattern}"
-                        f":{similarity:.2f}"
+                        f"fuzzy:"
+                        f"{token}->{pattern}:"
+                        f"{ratio:.2f}"
                     )
                 )
 
@@ -283,54 +360,355 @@ def channel_matches(name: str):
 
 
 # ============================================================
-# CHECK WHETHER CHANNEL CAN BE CONSIDERED
+# TEXT CHANNEL CHECK
 # ============================================================
 
-def is_text_like_channel(channel):
-    """
-    We only want channels that behave like text channels.
+def is_text_channel(channel):
 
-    Categories/voice/stage channels should not be included.
+    try:
+
+        # We only scan normal Guild TextChannels here.
+        #
+        # This automatically avoids:
+        #
+        # categories
+        # voice channels
+        # stage channels
+        # forums
+        # etc.
+
+        return isinstance(
+            channel,
+            discord.TextChannel
+        )
+
+
+    except Exception:
+
+        return False
+
+
+# ============================================================
+# GET OUR MEMBER OBJECT
+# ============================================================
+
+def get_self_member(bot, guild):
+
+    try:
+
+        # Usually available
+        member = getattr(
+            guild,
+            "me",
+            None
+        )
+
+
+        if member is not None:
+
+            return member
+
+
+        # Fallback
+        if bot.user:
+
+            return guild.get_member(
+                bot.user.id
+            )
+
+
+    except Exception:
+
+        pass
+
+
+    return None
+
+
+# ============================================================
+# PERMISSION CHECK
+# ============================================================
+
+def can_use_channel(bot, guild, channel):
+    """
+    Require:
+
+    • view channel
+    • read message history
+    • send messages
+
+    If ANY of these are unavailable:
+        reject channel
     """
 
     try:
 
-        # Guild text channels should have send()
-        # and are not categories.
-        if not hasattr(channel, "send"):
+        member = get_self_member(
+            bot,
+            guild
+        )
+
+
+        if member is None:
+
+            return (
+                False,
+                "member-not-found"
+            )
+
+
+        perms = channel.permissions_for(
+            member
+        )
+
+
+        if not getattr(
+            perms,
+            "view_channel",
+            False
+        ):
+
+            return (
+                False,
+                "cannot-view"
+            )
+
+
+        if not getattr(
+            perms,
+            "read_message_history",
+            False
+        ):
+
+            return (
+                False,
+                "cannot-read-history"
+            )
+
+
+        if not getattr(
+            perms,
+            "send_messages",
+            False
+        ):
+
+            return (
+                False,
+                "cannot-send"
+            )
+
+
+        return (
+            True,
+            "sendable"
+        )
+
+
+    except Exception as e:
+
+        return (
+            False,
+            (
+                f"permission-error:"
+                f"{type(e).__name__}"
+            )
+        )
+
+
+# ============================================================
+# MESSAGE TEXT / EMBED EXTRACTION
+# ============================================================
+
+def get_message_search_text(message):
+    """
+    Build one searchable string from:
+
+    • normal message content
+    • embed URL
+    • embed title
+    • embed description
+    • embed fields
+    """
+
+    pieces = []
+
+
+    # ========================================================
+    # NORMAL CONTENT
+    # ========================================================
+
+    try:
+
+        if message.content:
+
+            pieces.append(
+                str(message.content)
+            )
+
+    except Exception:
+
+        pass
+
+
+    # ========================================================
+    # EMBEDS
+    # ========================================================
+
+    try:
+
+        for embed in message.embeds:
+
+            # URL
+            try:
+
+                if embed.url:
+
+                    pieces.append(
+                        str(embed.url)
+                    )
+
+            except Exception:
+
+                pass
+
+
+            # Title
+            try:
+
+                if embed.title:
+
+                    pieces.append(
+                        str(embed.title)
+                    )
+
+            except Exception:
+
+                pass
+
+
+            # Description
+            try:
+
+                if embed.description:
+
+                    pieces.append(
+                        str(embed.description)
+                    )
+
+            except Exception:
+
+                pass
+
+
+            # Fields
+            try:
+
+                for field in embed.fields:
+
+                    if field.name:
+
+                        pieces.append(
+                            str(field.name)
+                        )
+
+                    if field.value:
+
+                        pieces.append(
+                            str(field.value)
+                        )
+
+            except Exception:
+
+                pass
+
+
+    except Exception:
+
+        pass
+
+
+    return "\n".join(
+        pieces
+    )
+
+
+# ============================================================
+# INVITE CHECK
+# ============================================================
+
+def message_contains_discord_invite(message):
+
+    try:
+
+        text = get_message_search_text(
+            message
+        )
+
+
+        if not text:
+
             return False
 
 
-        # Explicitly reject common non-text channel types
-        channel_type = getattr(
-            channel,
+        return bool(
+            DISCORD_INVITE_REGEX.search(
+                text
+            )
+        )
+
+
+    except Exception:
+
+        return False
+
+
+# ============================================================
+# DETERMINE WHETHER MESSAGE IS MEANINGFUL
+# ============================================================
+
+def is_meaningful_message(message):
+
+    try:
+
+        # Ignore Discord system messages when possible.
+        message_type = getattr(
+            message,
             "type",
             None
         )
 
 
-        blocked_types = {
-            getattr(
-                discord.ChannelType,
-                "category",
-                None
-            ),
-
-            getattr(
-                discord.ChannelType,
-                "voice",
-                None
-            ),
-
-            getattr(
-                discord.ChannelType,
-                "stage_voice",
-                None
-            )
-        }
+        default_type = getattr(
+            discord.MessageType,
+            "default",
+            None
+        )
 
 
-        if channel_type in blocked_types:
+        reply_type = getattr(
+            discord.MessageType,
+            "reply",
+            None
+        )
+
+
+        if message_type not in {
+            default_type,
+            reply_type,
+            None
+        }:
+
+            return False
+
+
+        text = get_message_search_text(
+            message
+        ).strip()
+
+
+        # Ignore completely blank messages
+        if not text:
+
             return False
 
 
@@ -343,30 +721,183 @@ def is_text_like_channel(channel):
 
 
 # ============================================================
+# ANALYZE RECENT CHANNEL HISTORY
+# ============================================================
+
+async def analyze_channel_history(channel):
+    """
+    A real promo/ad channel should have many recent messages
+    containing Discord server invites.
+
+    Returns dictionary:
+
+    {
+        passed: True/False,
+        checked: X,
+        invites: Y,
+        ratio: 0.XX,
+        reason: "..."
+    }
+    """
+
+    meaningful = 0
+
+    invite_messages = 0
+
+
+    try:
+
+        async for message in channel.history(
+            limit=RECENT_MESSAGE_LIMIT
+        ):
+
+            if not is_meaningful_message(
+                message
+            ):
+
+                continue
+
+
+            meaningful += 1
+
+
+            if message_contains_discord_invite(
+                message
+            ):
+
+                invite_messages += 1
+
+
+    except discord.Forbidden:
+
+        return {
+            "passed": False,
+            "checked": 0,
+            "invites": 0,
+            "ratio": 0.0,
+            "reason": "history-forbidden"
+        }
+
+
+    except discord.HTTPException as e:
+
+        return {
+            "passed": False,
+            "checked": 0,
+            "invites": 0,
+            "ratio": 0.0,
+            "reason": (
+                f"history-http:"
+                f"{getattr(e, 'status', 'unknown')}"
+            )
+        }
+
+
+    except Exception as e:
+
+        return {
+            "passed": False,
+            "checked": 0,
+            "invites": 0,
+            "ratio": 0.0,
+            "reason": (
+                f"history-error:"
+                f"{type(e).__name__}"
+            )
+        }
+
+
+    # ========================================================
+    # TOO FEW MESSAGES
+    # ========================================================
+
+    if meaningful < MIN_RECENT_MESSAGES:
+
+        return {
+            "passed": False,
+            "checked": meaningful,
+            "invites": invite_messages,
+            "ratio": (
+                invite_messages / meaningful
+                if meaningful
+                else 0.0
+            ),
+            "reason": "too-few-messages"
+        }
+
+
+    # ========================================================
+    # RATIO
+    # ========================================================
+
+    ratio = (
+        invite_messages / meaningful
+    )
+
+
+    # ========================================================
+    # MINIMUM INVITES
+    # ========================================================
+
+    if invite_messages < MIN_INVITE_MESSAGES:
+
+        return {
+            "passed": False,
+            "checked": meaningful,
+            "invites": invite_messages,
+            "ratio": ratio,
+            "reason": "too-few-invites"
+        }
+
+
+    # ========================================================
+    # MINIMUM INVITE RATIO
+    # ========================================================
+
+    if ratio < MIN_INVITE_RATIO:
+
+        return {
+            "passed": False,
+            "checked": meaningful,
+            "invites": invite_messages,
+            "ratio": ratio,
+            "reason": "low-invite-ratio"
+        }
+
+
+    # ========================================================
+    # SUCCESS
+    # ========================================================
+
+    return {
+        "passed": True,
+        "checked": meaningful,
+        "invites": invite_messages,
+        "ratio": ratio,
+        "reason": "promo-history"
+    }
+
+
+# ============================================================
 # BUILD MASS-SETC COMMANDS
 # ============================================================
 
-def build_mass_commands(channel_ids):
-    """
-    Converts:
-
-        [123, 456, 789]
-
-    into:
-
-        ,mass-setc 123 456 789
-
-    Automatically creates multiple commands when necessary.
-    """
+def build_mass_commands(
+    channel_ids
+):
 
     commands_to_send = []
 
-    current = f"{PREFIX}mass-setc"
+    current = (
+        f"{PREFIX}mass-setc"
+    )
 
 
     for channel_id in channel_ids:
 
-        addition = f" {channel_id}"
+        addition = (
+            f" {channel_id}"
+        )
 
 
         if (
@@ -375,10 +906,14 @@ def build_mass_commands(channel_ids):
             > MAX_COMMAND_LENGTH
         ):
 
-            commands_to_send.append(current)
+            commands_to_send.append(
+                current
+            )
+
 
             current = (
-                f"{PREFIX}mass-setc "
+                f"{PREFIX}"
+                f"mass-setc "
                 f"{channel_id}"
             )
 
@@ -388,9 +923,13 @@ def build_mass_commands(channel_ids):
             current += addition
 
 
-    if current != f"{PREFIX}mass-setc":
+    if current != (
+        f"{PREFIX}mass-setc"
+    ):
 
-        commands_to_send.append(current)
+        commands_to_send.append(
+            current
+        )
 
 
     return commands_to_send
@@ -402,9 +941,14 @@ def build_mass_commands(channel_ids):
 
 class FindNew(commands.Cog):
 
-    def __init__(self, bot):
+    def __init__(
+        self,
+        bot
+    ):
 
         self.bot = bot
+
+        self.running = False
 
 
     # ========================================================
@@ -419,139 +963,128 @@ class FindNew(commands.Cog):
         ctx
     ):
 
-        # ----------------------------------------------------
-        # START MESSAGE
-        # ----------------------------------------------------
+        # ====================================================
+        # PREVENT TWO FINDNEW SCANS AT ONCE
+        # ====================================================
 
-        status_message = None
+        if self.running:
 
-        try:
-
-            status_message = await ctx.send(
-                "🔎 **FindNew started**\n"
-                "Scanning every server for possible "
-                "collab/promo channels..."
+            return await ctx.send(
+                "⚠️ `,findnew` is already running."
             )
 
-        except Exception:
 
-            pass
+        self.running = True
 
-
-        # ----------------------------------------------------
-        # LOAD FRESH JSON DATA
-        # ----------------------------------------------------
 
         try:
+
+            # =================================================
+            # START
+            # =================================================
+
+            await ctx.send(
+                "🔎 **FindNew started**\n"
+                "Scanning servers using:\n"
+                "**name → permissions → recent ad history**"
+            )
+
+
+            # =================================================
+            # LOAD FRESH CHANNEL DATABASE
+            # =================================================
 
             data = load_data()
 
-        except Exception as e:
 
-            return await ctx.send(
-                "❌ Failed to load channel database:\n"
-                f"`{type(e).__name__}: {e}`"
-            )
+            existing_ids = set()
 
 
-        # ----------------------------------------------------
-        # EXISTING IDS
-        # ----------------------------------------------------
-
-        existing_ids = set()
-
-
-        for entry in data.get(
-            "channels",
-            []
-        ):
-
-            try:
-
-                channel_id = int(
-                    entry.get("id")
-                )
-
-                existing_ids.add(
-                    channel_id
-                )
-
-            except (
-                TypeError,
-                ValueError,
-                AttributeError
+            for entry in data.get(
+                "channels",
+                []
             ):
 
-                continue
+                try:
+
+                    existing_ids.add(
+                        int(
+                            entry["id"]
+                        )
+                    )
+
+                except Exception:
+
+                    continue
 
 
-        # ----------------------------------------------------
-        # RESULTS
-        # ----------------------------------------------------
+            # =================================================
+            # RESULTS
+            # =================================================
 
-        found_ids = []
+            found_ids = []
 
-        found_set = set()
+            found_set = set()
 
-        found_details = []
-
-
-        # ----------------------------------------------------
-        # STATS
-        # ----------------------------------------------------
-
-        servers_scanned = 0
-
-        channels_scanned = 0
-
-        already_saved_matches = 0
-
-        new_matches = 0
-
-        server_errors = 0
-
-        channel_errors = 0
+            found_details = []
 
 
-        # ----------------------------------------------------
-        # SNAPSHOT SERVER LIST
-        # ----------------------------------------------------
+            # =================================================
+            # STATS
+            # =================================================
 
-        try:
+            servers_scanned = 0
 
-            guilds = list(
-                self.bot.guilds
-            )
+            channels_scanned = 0
 
-        except Exception as e:
+            name_matches = 0
 
-            return await ctx.send(
-                "❌ Couldn't read server list:\n"
-                f"`{type(e).__name__}: {e}`"
-            )
+            already_saved = 0
 
+            permission_rejected = 0
 
-        if not guilds:
+            history_checked = 0
 
-            return await ctx.send(
-                "⚠️ No servers were found."
-            )
+            history_rejected = 0
+
+            new_matches = 0
+
+            errors = 0
 
 
-        # ====================================================
-        # SCAN EVERY SERVER
-        # ====================================================
-
-        for guild in guilds:
+            # =================================================
+            # GET SERVERS
+            # =================================================
 
             try:
+
+                guilds = list(
+                    self.bot.guilds
+                )
+
+            except Exception as e:
+
+                return await ctx.send(
+                    "❌ Couldn't access server list:\n"
+                    f"`{type(e).__name__}: {e}`"
+                )
+
+
+            if not guilds:
+
+                return await ctx.send(
+                    "⚠️ No servers found."
+                )
+
+
+            # =================================================
+            # SCAN ALL SERVERS
+            # =================================================
+
+            for guild in guilds:
 
                 servers_scanned += 1
 
-
-                # --------------------------------------------
-                # Prefer text_channels
-                # --------------------------------------------
 
                 try:
 
@@ -559,34 +1092,45 @@ class FindNew(commands.Cog):
                         guild.text_channels
                     )
 
-                except Exception:
+                except Exception as e:
 
-                    # Fallback
-                    channels = list(
+                    errors += 1
+
+                    print(
+                        "[findnew] Could not read channels:",
                         getattr(
                             guild,
-                            "channels",
-                            []
-                        )
+                            "name",
+                            "Unknown"
+                        ),
+                        type(e).__name__,
+                        e
                     )
 
+                    continue
 
-                # ============================================
-                # SCAN CHANNELS
-                # ============================================
+
+                # =============================================
+                # SCAN SERVER CHANNELS
+                # =============================================
 
                 for channel in channels:
 
                     try:
 
-                        if not is_text_like_channel(
+                        channels_scanned += 1
+
+
+                        # =====================================
+                        # STAGE 1:
+                        # CHANNEL TYPE
+                        # =====================================
+
+                        if not is_text_channel(
                             channel
                         ):
 
                             continue
-
-
-                        channels_scanned += 1
 
 
                         channel_name = getattr(
@@ -601,12 +1145,15 @@ class FindNew(commands.Cog):
                             continue
 
 
-                        # ------------------------------------
-                        # PATTERN TEST
-                        # ------------------------------------
+                        # =====================================
+                        # STAGE 2:
+                        # NAME PATTERN
+                        # =====================================
 
-                        matched, reason = channel_matches(
-                            channel_name
+                        matched, name_reason = (
+                            channel_matches(
+                                channel_name
+                            )
                         )
 
 
@@ -615,9 +1162,8 @@ class FindNew(commands.Cog):
                             continue
 
 
-                        # ------------------------------------
-                        # GET ID
-                        # ------------------------------------
+                        name_matches += 1
+
 
                         try:
 
@@ -625,82 +1171,155 @@ class FindNew(commands.Cog):
                                 channel.id
                             )
 
-                        except (
-                            TypeError,
-                            ValueError,
-                            AttributeError
-                        ):
+                        except Exception:
 
                             continue
 
 
-                        # ------------------------------------
-                        # ALREADY SAVED?
-                        # ------------------------------------
+                        # =====================================
+                        # STAGE 3:
+                        # ALREADY SAVED
+                        #
+                        # Do this BEFORE API history calls.
+                        # Saves unnecessary requests.
+                        # =====================================
 
                         if channel_id in existing_ids:
 
-                            already_saved_matches += 1
+                            already_saved += 1
 
                             continue
 
-
-                        # ------------------------------------
-                        # ALREADY FOUND DURING THIS SCAN?
-                        # ------------------------------------
 
                         if channel_id in found_set:
 
                             continue
 
 
-                        # ------------------------------------
-                        # NEW!
-                        # ------------------------------------
+                        # =====================================
+                        # STAGE 4:
+                        # PERMISSIONS
+                        # =====================================
+
+                        usable, permission_reason = (
+                            can_use_channel(
+                                self.bot,
+                                guild,
+                                channel
+                            )
+                        )
+
+
+                        if not usable:
+
+                            permission_rejected += 1
+
+                            continue
+
+
+                        # =====================================
+                        # STAGE 5:
+                        # ACTUAL MESSAGE HISTORY
+                        # =====================================
+
+                        history_checked += 1
+
+
+                        analysis = (
+                            await analyze_channel_history(
+                                channel
+                            )
+                        )
+
+
+                        if not analysis[
+                            "passed"
+                        ]:
+
+                            history_rejected += 1
+
+                            await asyncio.sleep(
+                                HISTORY_DELAY
+                            )
+
+                            continue
+
+
+                        # =====================================
+                        # REAL MATCH
+                        # =====================================
 
                         found_set.add(
                             channel_id
                         )
 
+
                         found_ids.append(
                             channel_id
                         )
 
+
                         new_matches += 1
 
 
-                        found_details.append({
+                        found_details.append(
+                            {
+                                "id": channel_id,
 
-                            "id": channel_id,
+                                "guild": getattr(
+                                    guild,
+                                    "name",
+                                    "Unknown Server"
+                                ),
 
-                            "guild": getattr(
-                                guild,
-                                "name",
-                                "Unknown Server"
-                            ),
+                                "channel": channel_name,
 
-                            "channel": channel_name,
+                                "name_reason": (
+                                    name_reason
+                                ),
 
-                            "reason": reason
+                                "messages": (
+                                    analysis[
+                                        "checked"
+                                    ]
+                                ),
 
-                        })
+                                "invites": (
+                                    analysis[
+                                        "invites"
+                                    ]
+                                ),
+
+                                "ratio": (
+                                    analysis[
+                                        "ratio"
+                                    ]
+                                )
+                            }
+                        )
+
+
+                        # Small pause between API calls
+                        await asyncio.sleep(
+                            HISTORY_DELAY
+                        )
 
 
                     except Exception as e:
 
-                        channel_errors += 1
+                        errors += 1
 
                         print(
                             "[findnew] Channel error:",
                             getattr(
                                 guild,
                                 "name",
-                                "Unknown"
+                                "Unknown Server"
                             ),
                             getattr(
                                 channel,
                                 "name",
-                                "Unknown"
+                                "Unknown Channel"
                             ),
                             type(e).__name__,
                             e
@@ -709,196 +1328,194 @@ class FindNew(commands.Cog):
                         continue
 
 
-            except Exception as e:
+            # =================================================
+            # NOTHING FOUND
+            # =================================================
 
-                server_errors += 1
+            if not found_ids:
 
-                print(
-                    "[findnew] Server error:",
-                    getattr(
-                        guild,
-                        "name",
-                        "Unknown"
-                    ),
-                    type(e).__name__,
-                    e
+                return await ctx.send(
+
+                    "✅ **FindNew finished**\n\n"
+
+                    f"Servers scanned: "
+                    f"**{servers_scanned}**\n"
+
+                    f"Channels scanned: "
+                    f"**{channels_scanned}**\n"
+
+                    f"Name candidates: "
+                    f"**{name_matches}**\n"
+
+                    f"Already saved: "
+                    f"**{already_saved}**\n"
+
+                    f"Rejected — can't send/read: "
+                    f"**{permission_rejected}**\n"
+
+                    f"History checked: "
+                    f"**{history_checked}**\n"
+
+                    f"Rejected — not enough "
+                    f"real invite posts: "
+                    f"**{history_rejected}**\n"
+
+                    f"New real promo channels: "
+                    f"**0**\n\n"
+
+                    "No new channels passed all filters."
                 )
 
-                continue
+
+            # =================================================
+            # CREATE MASS SETC
+            # =================================================
+
+            commands_to_send = (
+                build_mass_commands(
+                    found_ids
+                )
+            )
 
 
-        # ====================================================
-        # NOTHING FOUND
-        # ====================================================
+            # =================================================
+            # SUMMARY
+            # =================================================
 
-        if not found_ids:
-
-            result = (
+            await ctx.send(
 
                 "✅ **FindNew finished**\n\n"
 
-                f"Servers scanned: **{servers_scanned}**\n"
+                f"Servers scanned: "
+                f"**{servers_scanned}**\n"
 
-                f"Channels scanned: **{channels_scanned}**\n"
+                f"Channels scanned: "
+                f"**{channels_scanned}**\n"
 
-                f"Matching channels already saved: "
-                f"**{already_saved_matches}**\n"
+                f"Name candidates: "
+                f"**{name_matches}**\n"
 
-                "New matching channels: **0**\n\n"
+                f"Already saved: "
+                f"**{already_saved}**\n"
 
-                "🎉 No new matching collab/promo "
-                "channels were found."
+                f"Rejected — can't send/read: "
+                f"**{permission_rejected}**\n"
 
+                f"History checked: "
+                f"**{history_checked}**\n"
+
+                f"Rejected — not real "
+                f"promo history: "
+                f"**{history_rejected}**\n"
+
+                f"🔥 New real promo channels: "
+                f"**{new_matches}**\n"
+
+                f"`mass-setc` commands: "
+                f"**{len(commands_to_send)}**"
             )
 
 
-            if server_errors:
+            # =================================================
+            # PREVIEW FIRST 20
+            # =================================================
 
-                result += (
-                    f"\nServer errors: "
-                    f"**{server_errors}**"
+            preview = []
+
+
+            for item in found_details[
+                :20
+            ]:
+
+                percentage = int(
+                    item["ratio"]
+                    * 100
                 )
 
 
-            if channel_errors:
+                preview.append(
 
-                result += (
-                    f"\nChannel errors: "
-                    f"**{channel_errors}**"
+                    f"• **{item['guild']}** / "
+                    f"`#{item['channel']}`\n"
+
+                    f"  `{item['id']}` — "
+
+                    f"**{item['invites']}/"
+                    f"{item['messages']}** "
+
+                    f"recent messages contain "
+                    f"Discord invites "
+                    f"(**{percentage}%**)"
+
                 )
 
 
-            return await ctx.send(
-                result
-            )
+            if preview:
 
-
-        # ====================================================
-        # BUILD MASS-SETC
-        # ====================================================
-
-        try:
-
-            commands_to_send = build_mass_commands(
-                found_ids
-            )
-
-        except Exception as e:
-
-            return await ctx.send(
-                "❌ Found channels, but failed to build "
-                "`mass-setc` command:\n"
-                f"`{type(e).__name__}: {e}`"
-            )
-
-
-        # ====================================================
-        # FINISHED SUMMARY
-        # ====================================================
-
-        summary = [
-
-            "✅ **FindNew finished**",
-
-            "",
-
-            f"Servers scanned: "
-            f"**{servers_scanned}**",
-
-            f"Channels scanned: "
-            f"**{channels_scanned}**",
-
-            f"Matching channels already saved: "
-            f"**{already_saved_matches}**",
-
-            f"New matching channels: "
-            f"**{new_matches}**",
-
-            f"`mass-setc` commands generated: "
-            f"**{len(commands_to_send)}**",
-
-        ]
-
-
-        if server_errors:
-
-            summary.append(
-                f"Server errors: "
-                f"**{server_errors}**"
-            )
-
-
-        if channel_errors:
-
-            summary.append(
-                f"Channel errors: "
-                f"**{channel_errors}**"
-            )
-
-
-        await ctx.send(
-            "\n".join(summary)
-        )
-
-
-        # ====================================================
-        # OPTIONAL MATCH PREVIEW
-        # ====================================================
-
-        preview_lines = []
-
-
-        for item in found_details[:20]:
-
-            preview_lines.append(
-
-                f"• **{item['guild']}** / "
-                f"`#{item['channel']}`\n"
-                f"  `{item['id']}` "
-                f"({item['reason']})"
-
-            )
-
-
-        if preview_lines:
-
-            preview_text = (
-                "🔍 **New matches preview:**\n"
-                + "\n".join(
-                    preview_lines
+                # Split preview because fancy names
+                # can become very long.
+                current = (
+                    "🔍 **Verified preview:**\n"
                 )
-            )
 
 
-            # Safety in case fancy Discord names
-            # make the message too long.
-            if len(preview_text) <= 1900:
+                for line in preview:
+
+                    addition = (
+                        line
+                        + "\n"
+                    )
+
+
+                    if (
+                        len(current)
+                        + len(addition)
+                        > 1850
+                    ):
+
+                        await ctx.send(
+                            current
+                        )
+
+                        current = (
+                            "🔍 **Preview continued:**\n"
+                            + addition
+                        )
+
+                    else:
+
+                        current += addition
+
+
+                if current.strip():
+
+                    await ctx.send(
+                        current
+                    )
+
+
+            if len(found_details) > 20:
 
                 await ctx.send(
-                    preview_text
+
+                    f"ℹ️ Preview shows first "
+                    f"**20** of "
+                    f"**{len(found_details)}** "
+                    f"verified channels."
+
                 )
 
 
-        if len(found_details) > 20:
+            # =================================================
+            # MASS-SETC OUTPUT
+            # =================================================
 
             await ctx.send(
-                f"ℹ️ Showing first **20** matches above. "
-                f"There are **{len(found_details)}** total."
+                "📋 **Ready to paste:**"
             )
 
 
-        # ====================================================
-        # SEND READY-TO-PASTE COMMANDS
-        # ====================================================
-
-        await ctx.send(
-            "📋 **Ready to paste:**"
-        )
-
-
-        for command_text in commands_to_send:
-
-            try:
+            for command_text in commands_to_send:
 
                 await ctx.send(
                     f"```text\n"
@@ -906,13 +1523,50 @@ class FindNew(commands.Cog):
                     f"```"
                 )
 
-            except Exception as e:
+
+        # ====================================================
+        # GLOBAL ERROR
+        # ====================================================
+
+        except asyncio.CancelledError:
+
+            try:
 
                 await ctx.send(
-                    "⚠️ Failed sending one generated "
-                    "command:\n"
+                    "⚠️ `,findnew` was cancelled."
+                )
+
+            except Exception:
+
+                pass
+
+            raise
+
+
+        except Exception as e:
+
+            print(
+                "[findnew] Fatal error:",
+                type(e).__name__,
+                e
+            )
+
+
+            try:
+
+                await ctx.send(
+                    "❌ **FindNew crashed:**\n"
                     f"`{type(e).__name__}: {e}`"
                 )
+
+            except Exception:
+
+                pass
+
+
+        finally:
+
+            self.running = False
 
 
 # ============================================================
