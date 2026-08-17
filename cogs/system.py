@@ -128,26 +128,22 @@ class AutoPromo(commands.Cog):
         await self._common_start(ctx, reverse=True)
 
 
-    @commands.command()
+@commands.command()
+async def stop(self, ctx):
 
-    async def stop(self, ctx):
+    self.data = load_data()
 
-        if not self.data.get("auto"):
+    if not self.data.get("auto"):
+        return await ctx.send("ℹ️  Auto-cycle isn’t running.")
 
-            return await ctx.send("ℹ️  Auto-cycle isn’t running.")
+    self.data["auto"] = False
+    self.data["next_run"] = None
+    save_data(self.data)
 
-        self.data["auto"] = False
+    if self.loop_task and not self.loop_task.done():
+        self.loop_task.cancel()
 
-        self.data["next_run"] = None
-
-        save_data(self.data)
-
-        if self.loop_task and not self.loop_task.done():
-
-            self.loop_task.cancel()
-
-        await ctx.send("🛑 Auto-cycle stopped.")
-
+    await ctx.send("🛑 Auto-cycle stopped.")
 
     # ── scheduling ──
 
