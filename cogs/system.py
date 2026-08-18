@@ -1,3 +1,8 @@
+Library
+/
+system_fixed.py
+
+
 # cogs/system.py
 
 import asyncio
@@ -23,7 +28,7 @@ SEND_DELAY = 10
 
 RETRY_DELAY = 5
 
-MAX_RETRIES = 2
+MAX_RETRIES = 0
 
 
 # ============================================================
@@ -114,13 +119,9 @@ def default_data():
         # batch 4-6
         # batch_attempt_start = 3
         #
-        # If channel 5 breaks:
-        #
-        # ,continue
-        #     resumes channel 5
-        #
-        # ,recontinue
-        #     resets back to channel 4
+        # Legacy batch marker kept for backwards-compatible
+        # channels.json files.  Current ,recontinue resumes from
+        # the exact first unsent channel after reloading all cogs.
         #
         "batch_attempt_start": 0,
 
@@ -361,6 +362,11 @@ class AutoPromo(
 
         # Prevent two batches from running simultaneously.
         self.batch_lock = asyncio.Lock()
+
+        # The Discord command task currently executing a batch.
+        # ,recontinue may cancel this task, reload all cogs, then
+        # resume from the exact first unsent channel saved on disk.
+        self.active_batch_task = None
 
 
         # Rate-limit logger recursion guard
@@ -852,7 +858,7 @@ class AutoPromo(
         # There is NO command waiting for ,continue.
         # ====================================================
 
-        await self._run_next_batch()
+        await self._execute_batch()
 
 
     # ========================================================
@@ -898,6 +904,120 @@ class AutoPromo(
 
 
     # ========================================================
+    # EXECUTE / TRACK ONE BATCH COMMAND
+    # ========================================================
+
+    async def _execute_batch(
+        self
+    ):
+
+        task = asyncio.current_task()
+
+        self.active_batch_task = task
+
+        try:
+
+            await self._run_next_batch()
+
+        finally:
+
+            if self.active_batch_task is task:
+
+                self.active_batch_task = None
+
+
+    # ========================================================
+    # FORCE-RELOAD ALL COGS
+    # ========================================================
+
+    async def _reload_all_cogs(
+        self
+    ):
+
+        """
+        Reload every .py extension in ./cogs.
+
+        Batch state is NOT kept only in RAM.  The exact progress,
+        snapshot, message and direction are stored in
+        /data/channels.json, so reloading the cogs does not reset
+        the active cycle.
+        """
+
+        bot = self.bot
+
+        cogs_dir = os.path.dirname(
+            os.path.abspath(
+                __file__
+            )
+        )
+
+        if not os.path.isdir(
+            cogs_dir
+        ):
+
+            return bot.get_cog(
+                "AutoPromo"
+            )
+
+        extensions = []
+
+        for filename in sorted(
+            os.listdir(
+                cogs_dir
+            )
+        ):
+
+            if (
+                not filename.endswith(
+                    ".py"
+                )
+                or
+                filename.startswith(
+                    "_"
+                )
+            ):
+
+                continue
+
+            name = filename[:-3]
+
+            extensions.append(
+                f"cogs.{name}"
+            )
+
+
+        for extension in extensions:
+
+            try:
+
+                if extension in bot.extensions:
+
+                    await bot.reload_extension(
+                        extension
+                    )
+
+                else:
+
+                    await bot.load_extension(
+                        extension
+                    )
+
+            except Exception as e:
+
+                print(
+                    "Cog reload error:",
+                    extension,
+                    type(e).__name__,
+                    e
+                )
+
+
+        return bot.get_cog(
+            "AutoPromo"
+        )
+
+
+    # ========================================================
     # INTERNAL CONTINUE
     # ========================================================
 
@@ -919,14 +1039,57 @@ class AutoPromo(
             return
 
 
+        # ====================================================
+        # RECONTINUE = FORCE CURRENT BATCH TO STOP
+        # ====================================================
+
         if self.batch_lock.locked():
 
-            return await ctx.send(
+            if not replay:
 
-                "⚠️ A 3-channel batch is "
-                "already processing."
+                return await ctx.send(
 
-            )
+                    "⚠️ A 3-channel batch is "
+                    "already processing."
+
+                )
+
+
+            active = self.active_batch_task
+
+            if (
+                active
+                and
+                not active.done()
+                and
+                active is not asyncio.current_task()
+            ):
+
+                active.cancel()
+
+                try:
+
+                    await active
+
+                except asyncio.CancelledError:
+
+                    pass
+
+                except Exception:
+
+                    pass
+
+
+            # Give the cancelled batch a chance to release its lock.
+            for _ in range(20):
+
+                if not self.batch_lock.locked():
+
+                    break
+
+                await asyncio.sleep(
+                    0.05
+                )
 
 
         self.data = load_data()
@@ -976,68 +1139,68 @@ class AutoPromo(
 
         # ====================================================
         # RECONTINUE
+        #
+        # Different from ,continue:
+        #
+        # 1. Force-stop a currently running batch if needed.
+        # 2. KEEP the exact first unsent channel.
+        # 3. Reload ALL cogs.
+        # 4. Resume from that exact saved channel.
+        #
+        # Successful channels are NEVER replayed.
         # ====================================================
 
         if replay:
 
-            retry_start = int(
-
-                self.data.get(
-                    "batch_attempt_start",
-                    current
-                )
-
-            )
-
-
-            retry_start = max(
-                0,
-                min(
-                    retry_start,
-                    total
-                )
-            )
-
-
-            self.data[
-                "batch_index"
-            ] = retry_start
-
-
-            self.data[
-                "batch_last_error"
-            ] = None
-
-
-            save_data(
-                self.data
-            )
-
-
             await ctx.send(
 
                 "🔁 **Recontinue**\n"
-                f"Replaying the current batch from "
-                f"channel **{retry_start + 1}**.\n"
+                "Force-stopping the current batch if needed, "
+                "reloading all cogs, and resuming from the "
+                f"first unsent channel **{current + 1}**.\n"
                 f"Sending maximum **{BATCH_SIZE}** channels."
 
             )
 
 
-        else:
+            # Progress is already persisted in /data/channels.json.
+            # Reloading cogs therefore cannot erase the active batch.
+            new_cog = await self._reload_all_cogs()
 
-            await ctx.send(
 
-                "▶️ **Continue**\n"
-                f"Resuming from channel "
-                f"**{current + 1}**.\n"
-                f"Sending maximum **{BATCH_SIZE}** channels."
+            if new_cog is None:
 
-            )
+                return await ctx.send(
+
+                    "❌ Cogs reloaded, but AutoPromo "
+                    "could not be found."
+
+                )
+
+
+            new_cog.data = load_data()
+
+            await new_cog._execute_batch()
+
+            return
+
+
+        # ====================================================
+        # NORMAL CONTINUE
+        # ====================================================
+
+        await ctx.send(
+
+            "▶️ **Continue**\n"
+            f"Resuming from channel "
+            f"**{current + 1}**.\n"
+            f"Sending maximum **{BATCH_SIZE}** channels."
+
+        )
 
 
         # New command execution.
-        await self._run_next_batch()
+        await self._execute_batch()
 
 
     # ========================================================
@@ -1481,7 +1644,7 @@ class AutoPromo(
             # Then _loop itself ends.
             # =================================================
 
-            await self._run_next_batch()
+            await self._execute_batch()
 
 
             return
@@ -1517,14 +1680,15 @@ class AutoPromo(
 
         self.data = load_data()
 
-
-        # DO NOT advance index.
+        # A failed channel is considered processed/skipped.
         #
-        # This means regular ,continue resumes
-        # at this same failed channel.
+        # Never trap ,continue on the same bad server.
+        # Example:
+        # channel 26 fails -> batch_index becomes 26 (zero-based
+        # next position = human channel 27).
         self.data[
             "batch_index"
-        ] = position
+        ] = position + 1
 
 
         self.data[
@@ -1815,346 +1979,244 @@ class AutoPromo(
 
 
                 # =============================================
-                # SEND
+                # SEND — EXACTLY ONE ATTEMPT
                 # =============================================
 
                 sent = False
 
+                try:
 
-                for attempt in range(
+                    # discord.py can internally wait on a 429.
+                    # This timeout prevents one bad server from
+                    # holding the command for hours.
+                    await asyncio.wait_for(
 
-                    1,
+                        chan.send(
+                            promo
+                        ),
 
-                    MAX_RETRIES + 2
+                        timeout=SEND_TIMEOUT
 
-                ):
-
-                    try:
-
-                        # =====================================
-                        # CRITICAL:
-                        #
-                        # discord.py can internally sit on a
-                        # 429 for hours.
-                        #
-                        # asyncio.wait_for prevents THIS batch
-                        # command from staying alive forever.
-                        # =====================================
-
-                        await asyncio.wait_for(
-
-                            chan.send(
-                                promo
-                            ),
-
-                            timeout=SEND_TIMEOUT
-
-                        )
-
-
-                        # =====================================
-                        # SUCCESS
-                        # =====================================
-
-                        self.data = load_data()
-
-
-                        entry = (
-                            self._find_channel_entry(
-                                channel_id
-                            )
-                        )
-
-
-                        if entry is not None:
-
-                            entry[
-                                "last_sent"
-                            ] = (
-                                utc_now().isoformat()
-                            )
-
-
-                        # Exact next position
-                        self.data[
-                            "batch_index"
-                        ] = position + 1
-
-
-                        self.data[
-                            "batch_last_error"
-                        ] = None
-
-
-                        save_data(
-                            self.data
-                        )
-
-
-                        await self._log(
-
-                            f"✅ [{attempt}] "
-                            f"{chan.guild.name}/"
-                            f"#{chan.name}"
-
-                        )
-
-
-                        sent = True
-
-                        break
+                    )
 
 
                     # =========================================
-                    # INTERNAL 429 / SEND HANG
+                    # SUCCESS
                     # =========================================
 
-                    except asyncio.TimeoutError:
+                    self.data = load_data()
 
-                        error_text = (
 
-                            f"Send timed out after "
-                            f"{SEND_TIMEOUT}s on "
-                            f"{chan.guild.name}/"
-                            f"#{chan.name}"
+                    entry = (
+                        self._find_channel_entry(
+                            channel_id
+                        )
+                    )
 
+
+                    if entry is not None:
+
+                        entry[
+                            "last_sent"
+                        ] = (
+                            utc_now().isoformat()
                         )
 
 
-                        self._save_batch_error(
-
-                            position,
-
-                            error_text
-
-                        )
+                    self.data[
+                        "batch_index"
+                    ] = position + 1
 
 
-                        await self._log(
-
-                            "🚨 **Batch stopped**\n\n"
-
-                            f"Channel: "
-                            f"**{position + 1}/{total}**\n"
-
-                            f"Server: "
-                            f"**{chan.guild.name}**\n"
-
-                            f"Channel: "
-                            f"`#{chan.name}`\n\n"
-
-                            f"`chan.send()` did not complete "
-                            f"within **{SEND_TIMEOUT}s**.\n"
-
-                            "Discord may currently be "
-                            "rate-limiting this send.\n\n"
-
-                            f"Progress remains at "
-                            f"**{position}/{total}**.\n\n"
-
-                            "`,continue` = resume from this "
-                            "failed channel\n"
-
-                            "`,recontinue` = replay this whole "
-                            "3-channel batch"
-
-                        )
+                    self.data[
+                        "batch_last_error"
+                    ] = None
 
 
-                        # =====================================
-                        # COMMAND ENDS RIGHT NOW
-                        # =====================================
-
-                        return
+                    save_data(
+                        self.data
+                    )
 
 
-                    # =========================================
-                    # HTTP EXCEPTION
-                    # =========================================
+                    await self._log(
 
-                    except discord.HTTPException as e:
+                        f"✅ [1] "
+                        f"{chan.guild.name}/"
+                        f"#{chan.name}"
 
-                        wait = max(
-
-                            RETRY_DELAY,
-
-                            int(
-
-                                getattr(
-
-                                    e,
-
-                                    "retry_after",
-
-                                    RETRY_DELAY
-
-                                )
-
-                            )
-
-                        )
+                    )
 
 
-                        # Long rate limit:
-                        # DON'T leave command sleeping.
-                        if wait > (
-                            MAX_INLINE_RETRY_WAIT
-                        ):
+                    sent = True
+
+
+                # =============================================
+                # SEND TIMEOUT / INTERNAL 429 WAIT
+                # =============================================
+
+                except asyncio.TimeoutError:
+
+                    error_text = (
+
+                        f"Send timed out after "
+                        f"{SEND_TIMEOUT}s on "
+                        f"{chan.guild.name}/"
+                        f"#{chan.name}"
+
+                    )
+
+
+                    # IMPORTANT:
+                    # Failed channel is SKIPPED, not retried.
+                    self._save_batch_error(
+
+                        position,
+
+                        error_text
+
+                    )
+
+
+                    await self._log(
+
+                        "⏩ **Skipped failed channel**\n"
+                        f"Channel: **{position + 1}/{total}**\n"
+                        f"Server: **{chan.guild.name}**\n"
+                        f"Channel: `#{chan.name}`\n"
+                        f"Reason: send timed out after "
+                        f"**{SEND_TIMEOUT}s**.\n"
+                        "No retry. Moving on."
+
+                    )
+
+
+                # =============================================
+                # DISCORD HTTP ERROR
+                # =============================================
+
+                except discord.HTTPException as e:
+
+                    status = getattr(
+                        e,
+                        "status",
+                        None
+                    )
+
+                    retry_after = getattr(
+                        e,
+                        "retry_after",
+                        None
+                    )
+
+
+                    if status == 429:
+
+                        if retry_after is not None:
 
                             error_text = (
 
-                                f"Discord requested "
-                                f"{wait}s retry wait on "
+                                f"Discord 429 rate limit "
+                                f"(retry_after={retry_after}) on "
                                 f"{chan.guild.name}/"
                                 f"#{chan.name}"
 
                             )
-
-
-                            self._save_batch_error(
-
-                                position,
-
-                                error_text
-
-                            )
-
-
-                            await self._log(
-
-                                "🚨 **Long Discord rate limit**\n\n"
-
-                                f"Channel: "
-                                f"**{position + 1}/{total}**\n"
-
-                                f"Server: "
-                                f"**{chan.guild.name}**\n"
-
-                                f"Channel: "
-                                f"`#{chan.name}`\n"
-
-                                f"Retry-after: "
-                                f"**{wait}s**\n\n"
-
-                                "This batch command is ending "
-                                "instead of sleeping for hours.\n\n"
-
-                                "`,continue` resumes here later.\n"
-
-                                "`,recontinue` replays this "
-                                "3-channel block."
-
-                            )
-
-
-                            return
-
-
-                        # Short normal retry
-                        if attempt <= (
-                            MAX_RETRIES
-                        ):
-
-                            await self._log(
-
-                                f"⚠️ Rate-limit on "
-                                f"{chan.guild.name}/"
-                                f"#{chan.name} "
-                                f"– retry in {wait}s "
-                                f"({attempt}/"
-                                f"{MAX_RETRIES + 1})"
-
-                            )
-
-
-                            await asyncio.sleep(
-                                wait
-                            )
-
 
                         else:
 
                             error_text = (
 
-                                f"Give-up after "
-                                f"{MAX_RETRIES + 1} attempts "
-                                f"on {chan.guild.name}/"
+                                f"Discord 429 rate limit on "
+                                f"{chan.guild.name}/"
                                 f"#{chan.name}"
 
                             )
 
-
-                            self._save_batch_error(
-
-                                position,
-
-                                error_text
-
-                            )
-
-
-                            await self._log(
-
-                                f"❌ Give-up "
-                                f"{chan.guild.name}/"
-                                f"#{chan.name}\n\n"
-
-                                "Batch stopped at this channel.\n"
-
-                                "Use `,continue` later or "
-                                "`,recontinue` to replay "
-                                "the current batch."
-
-                            )
-
-
-                            return
-
-
-                    # =========================================
-                    # GENERIC ERROR
-                    # =========================================
-
-                    except Exception as e:
+                    else:
 
                         error_text = (
 
-                            f"{type(e).__name__}: {e}"
+                            f"Discord HTTP {status}: {e}"
 
                         )
 
 
-                        self._save_batch_error(
+                    # Exactly one attempt. Skip this channel.
+                    self._save_batch_error(
 
-                            position,
+                        position,
 
-                            error_text
+                        error_text
 
+                    )
+
+
+                    if status == 429:
+
+                        retry_text = (
+
+                            f" Retry-after: **{retry_after}s**."
+                            if retry_after is not None
+                            else ""
                         )
-
 
                         await self._log(
 
-                            "❌ **Batch error**\n\n"
+                            "⏩ **Skipped rate-limited channel**\n"
+                            f"Channel: **{position + 1}/{total}**\n"
+                            f"Server: **{chan.guild.name}**\n"
+                            f"Channel: `#{chan.name}`\n"
+                            f"No retry.{retry_text}\n"
+                            "Moving on."
 
-                            f"Channel: "
-                            f"**{position + 1}/{total}**\n"
+                        )
 
-                            f"{chan.guild.name}/"
-                            f"#{chan.name}\n\n"
+                    else:
 
-                            f"`{type(e).__name__}: {e}`\n\n"
+                        await self._log(
 
-                            "`,continue` resumes from this "
-                            "channel.\n"
-
-                            "`,recontinue` replays the current "
-                            "3-channel block."
+                            "⏩ **Skipped HTTP-error channel**\n"
+                            f"Channel: **{position + 1}/{total}**\n"
+                            f"Server: **{chan.guild.name}**\n"
+                            f"Channel: `#{chan.name}`\n"
+                            f"`{type(e).__name__}: {e}`\n"
+                            "No retry. Moving on."
 
                         )
 
 
-                        return
+                # =============================================
+                # GENERIC ERROR
+                # =============================================
+
+                except Exception as e:
+
+                    error_text = (
+
+                        f"{type(e).__name__}: {e}"
+
+                    )
+
+
+                    self._save_batch_error(
+
+                        position,
+
+                        error_text
+
+                    )
+
+
+                    await self._log(
+
+                        "⏩ **Skipped errored channel**\n"
+                        f"Channel: **{position + 1}/{total}**\n"
+                        f"{chan.guild.name}/"
+                        f"#{chan.name}\n"
+                        f"`{type(e).__name__}: {e}`\n"
+                        "No retry. Moving on."
+
+                    )
 
 
                 # =============================================
