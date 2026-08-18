@@ -1,6 +1,3 @@
-Library
-/
-system_fixed.py
 
 
 # cogs/system.py
