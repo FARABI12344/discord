@@ -1,5 +1,3 @@
-
-
 # cogs/system.py
 
 import asyncio
@@ -924,23 +922,36 @@ class AutoPromo(
 
 
     # ========================================================
-    # FORCE-RELOAD ALL COGS
+    # RECONTINUE RELOAD SUPERVISOR
     # ========================================================
 
-    async def _reload_all_cogs(
-        self
+    async def _recontinue_reload_supervisor(
+        self,
+        control_channel_id
     ):
 
         """
-        Reload every .py extension in ./cogs.
+        Reload every .py extension in ./cogs, with this system cog
+        reloaded LAST.
 
-        Batch state is NOT kept only in RAM.  The exact progress,
-        snapshot, message and direction are stored in
-        /data/channels.json, so reloading the cogs does not reset
-        the active cycle.
+        IMPORTANT:
+        This method is launched as its own asyncio task before the
+        old ,recontinue command returns.  It never resumes a batch
+        through the old AutoPromo instance after cogs.system has
+        been reloaded.
+
+        Batch progress is already persisted in /data/channels.json.
+        The brand-new AutoPromo cog reloads that state and resumes
+        from the exact saved batch_index.
         """
 
         bot = self.bot
+
+        # Let the old ,recontinue callback fully return before
+        # unloading/reloading its cog.
+        await asyncio.sleep(
+            0.10
+        )
 
         cogs_dir = os.path.dirname(
             os.path.abspath(
@@ -952,9 +963,7 @@ class AutoPromo(
             cogs_dir
         ):
 
-            return bot.get_cog(
-                "AutoPromo"
-            )
+            return
 
         extensions = []
 
@@ -983,6 +992,28 @@ class AutoPromo(
             )
 
 
+        # Reload this extension LAST so the supervisor is not
+        # replacing its own cog until every other cog is done.
+        this_extension = __name__
+
+        extensions = [
+            ext
+            for ext in extensions
+            if ext != this_extension
+        ]
+
+        if this_extension in {
+            f"cogs.{os.path.splitext(os.path.basename(__file__))[0]}",
+            __name__
+        }:
+
+            extensions.append(
+                this_extension
+            )
+
+
+        reload_errors = []
+
         for extension in extensions:
 
             try:
@@ -1001,6 +1032,14 @@ class AutoPromo(
 
             except Exception as e:
 
+                reload_errors.append(
+                    (
+                        extension,
+                        type(e).__name__,
+                        str(e)
+                    )
+                )
+
                 print(
                     "Cog reload error:",
                     extension,
@@ -1009,9 +1048,67 @@ class AutoPromo(
                 )
 
 
-        return bot.get_cog(
+        # NEVER continue on the old self after system reload.
+        new_cog = bot.get_cog(
             "AutoPromo"
         )
+
+        control = bot.get_channel(
+            control_channel_id
+        )
+
+        if new_cog is None:
+
+            if control is not None:
+
+                try:
+
+                    await control.send(
+                        "❌ Recontinue reloaded the cogs, but "
+                        "the new AutoPromo cog could not be found."
+                    )
+
+                except Exception:
+
+                    pass
+
+            return
+
+
+        # Load the exact persisted state created by the old cog.
+        new_cog.data = load_data()
+
+        if not new_cog.data.get(
+            "auto"
+        ):
+
+            return
+
+        if not new_cog.data.get(
+            "batch_active"
+        ):
+
+            return
+
+
+        if reload_errors and control is not None:
+
+            try:
+
+                await control.send(
+                    "⚠️ Recontinue finished the reload, but "
+                    f"**{len(reload_errors)}** cog(s) had reload "
+                    "errors. AutoPromo will still resume from "
+                    "the saved position."
+                )
+
+            except Exception:
+
+                pass
+
+
+        # Fresh cog instance + fresh lock + persisted batch_index.
+        await new_cog._execute_batch()
 
 
     # ========================================================
@@ -1152,32 +1249,30 @@ class AutoPromo(
             await ctx.send(
 
                 "🔁 **Recontinue**\n"
-                "Force-stopping the current batch if needed, "
-                "reloading all cogs, and resuming from the "
-                f"first unsent channel **{current + 1}**.\n"
-                f"Sending maximum **{BATCH_SIZE}** channels."
+                "Force-stopped the old batch if needed.\n"
+                f"Saved next channel: **{current + 1}**.\n"
+                "Reloading **all cogs** now, then the fresh "
+                "AutoPromo cog will resume from that saved "
+                "channel."
 
             )
 
 
-            # Progress is already persisted in /data/channels.json.
-            # Reloading cogs therefore cannot erase the active batch.
-            new_cog = await self._reload_all_cogs()
+            # IMPORTANT:
+            # Do NOT reload cogs inline and then keep executing
+            # through this old self.  Launch an independent
+            # supervisor and RETURN from the old command first.
+            #
+            # All batch progress is already persisted in
+            # /data/channels.json, so the new AutoPromo instance
+            # can recover the exact batch_index after reload.
+            asyncio.create_task(
 
-
-            if new_cog is None:
-
-                return await ctx.send(
-
-                    "❌ Cogs reloaded, but AutoPromo "
-                    "could not be found."
-
+                self._recontinue_reload_supervisor(
+                    CONTROL_CHANNEL_ID
                 )
 
-
-            new_cog.data = load_data()
-
-            await new_cog._execute_batch()
+            )
 
             return
 
