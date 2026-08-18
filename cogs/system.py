@@ -1,632 +1,590 @@
 # cogs/system.py
 
-import asyncio, json, os, discord
+import asyncio
+import json
+import os
+import logging
+import time
+import discord
+
 from datetime import datetime, timedelta, timezone
 from discord.ext import commands
 
 
+# ============================================================
+# CONFIG
+# ============================================================
+
 DATA_FILE = "/data/channels.json"
 
 CYCLE_HOURS = 5
+
 SEND_DELAY = 10
+
 RETRY_DELAY = 5
+
 MAX_RETRIES = 2
 
-# NEW:
+
+# ============================================================
+# BATCH SYSTEM
+# ============================================================
+
 BATCH_SIZE = 3
 
 
-# ─────────── helpers ───────────
+# Only here can ANYONE use:
+#
+# ,continue
+# ,recontinue
+#
+CONTROL_CHANNEL_ID = 1533686495712510073
+
+
+# If discord.py gets stuck internally waiting on a huge
+# 429 retry-after, stop this command instead of allowing
+# the coroutine to remain alive for hours.
+#
+# This DOES NOT bypass Discord's rate limit.
+# It simply abandons this send attempt.
+SEND_TIMEOUT = 30
+
+
+# If an HTTPException actually reaches us with a retry_after
+# longer than this, don't sit and sleep for hours.
+MAX_INLINE_RETRY_WAIT = 30
+
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def utc_now() -> datetime:
-    return datetime.now(timezone.utc)
+
+    return datetime.now(
+        timezone.utc
+    )
 
 
 def default_data():
+
     return {
+
         "message": "",
+
         "channels": [],
+
         "auto": False,
+
         "next_run": None,
+
         "log_channel": None,
+
         "reverse": False,
 
-        # batch state
+
+        # ====================================================
+        # BATCH STATE
+        # ====================================================
+
         "batch_active": False,
+
+        # Exact next channel index
         "batch_index": 0,
+
+        # Snapshot of channel IDs for THIS cycle
         "batch_channel_ids": [],
+
+        # Snapshot of promo message for THIS cycle
         "batch_message": None,
+
         "batch_reverse": False,
-        "batch_started_at": None
+
+        "batch_started_at": None,
+
+
+        # ====================================================
+        # RECONTINUE STATE
+        # ====================================================
+
+        # Beginning of current 3-channel block.
+        #
+        # Example:
+        #
+        # batch 4-6
+        # batch_attempt_start = 3
+        #
+        # If channel 5 breaks:
+        #
+        # ,continue
+        #     resumes channel 5
+        #
+        # ,recontinue
+        #     resets back to channel 4
+        #
+        "batch_attempt_start": 0,
+
+        "batch_last_error": None
     }
 
 
+# ============================================================
+# LOAD DATA
+# ============================================================
+
 def load_data() -> dict:
 
-    if not os.path.exists(DATA_FILE):
+    if not os.path.exists(
+        DATA_FILE
+    ):
+
         return default_data()
 
-    with open(DATA_FILE, encoding="utf8") as fp:
-        data = json.load(fp)
 
-    # preserve compatibility with existing channels.json
+    with open(
+        DATA_FILE,
+        encoding="utf8"
+    ) as fp:
+
+        data = json.load(
+            fp
+        )
+
+
+    # Backwards compatibility with your old channels.json.
     defaults = default_data()
 
+
     for key, value in defaults.items():
-        data.setdefault(key, value)
+
+        data.setdefault(
+            key,
+            value
+        )
+
 
     return data
 
 
-def save_data(d: dict):
+# ============================================================
+# SAVE DATA
+# ============================================================
 
-    folder = os.path.dirname(DATA_FILE)
+def save_data(
+    data: dict
+):
+
+    folder = os.path.dirname(
+        DATA_FILE
+    )
+
 
     if folder:
-        os.makedirs(folder, exist_ok=True)
 
-    with open(DATA_FILE, "w", encoding="utf8") as fp:
+        os.makedirs(
+            folder,
+            exist_ok=True
+        )
+
+
+    with open(
+        DATA_FILE,
+        "w",
+        encoding="utf8"
+    ) as fp:
+
         json.dump(
-            d,
+
+            data,
+
             fp,
+
             indent=2,
+
             ensure_ascii=False
         )
 
 
-# ─────────── cog ───────────
+# ============================================================
+# DISCORD HTTP LOG FORWARDER
+# ============================================================
 
-class AutoPromo(commands.Cog):
+class DiscordRateLimitHandler(
+    logging.Handler
+):
 
     """
-    Auto promo system.
+    Watches discord.http logs.
+
+    When discord.py prints something such as:
+
+        We are being rate limited...
+        responded with 429...
+        Retrying in 5793 seconds
+
+    mirror that warning into the Discord control/log channel.
+    """
+
+    def __init__(
+        self,
+        cog
+    ):
+
+        super().__init__(
+            level=logging.WARNING
+        )
+
+        self.cog = cog
+
+        self.last_message = None
+
+        self.last_time = 0
+
+
+    def emit(
+        self,
+        record
+    ):
+
+        try:
+
+            message = record.getMessage()
+
+
+            lower = message.lower()
+
+
+            if (
+                "rate limit" not in lower
+                and
+                "429" not in lower
+            ):
+
+                return
+
+
+            # Avoid recursive warning loops while we're
+            # forwarding a rate-limit warning.
+            if self.cog._forwarding_rate_log:
+
+                return
+
+
+            # Basic duplicate protection.
+            now = time.monotonic()
+
+
+            if (
+                message == self.last_message
+                and
+                now - self.last_time < 5
+            ):
+
+                return
+
+
+            self.last_message = message
+
+            self.last_time = now
+
+
+            loop = self.cog.bot.loop
+
+
+            if loop.is_closed():
+
+                return
+
+
+            self.cog._forwarding_rate_log = True
+
+
+            loop.call_soon_threadsafe(
+
+                lambda: asyncio.create_task(
+
+                    self.cog._forward_rate_warning(
+                        message
+                    )
+
+                )
+
+            )
+
+
+        except Exception:
+
+            pass
+
+
+# ============================================================
+# COG
+# ============================================================
+
+class AutoPromo(
+    commands.Cog
+):
+
+    """
+    Auto Promo System
 
     ,start
-        forward cycle
+        start forward
 
     ,startb
-        reverse cycle
+        start reverse
 
-    Each command sends only 3 channels.
+    Each invocation sends maximum 3 channels.
 
     ,continue
-        sends the next 3.
+        next batch
 
-    When the entire cycle finishes, the next automatic cycle
-    is scheduled for CYCLE_HOURS later.
+    ,recontinue
+        replay the current/failed batch
+
+    The command DOES NOT wait around for the next command.
     """
 
-    def __init__(self, bot: commands.Bot):
+    def __init__(
+        self,
+        bot: commands.Bot
+    ):
 
         self.bot = bot
 
         self.data = load_data()
 
-        self.loop_task: asyncio.Task | None = None
+        self.loop_task: (
+            asyncio.Task | None
+        ) = None
 
+
+        # Prevent two batches from running simultaneously.
         self.batch_lock = asyncio.Lock()
 
-        # -----------------------------------------------------
-        # Restart recovery
-        # -----------------------------------------------------
+
+        # Rate-limit logger recursion guard
+        self._forwarding_rate_log = False
+
+
+        # ====================================================
+        # ATTACH RATE-LIMIT LOG MIRROR
+        # ====================================================
+
+        self.http_logger = logging.getLogger(
+            "discord.http"
+        )
+
+
+        self.rate_handler = (
+            DiscordRateLimitHandler(
+                self
+            )
+        )
+
+
+        self.http_logger.addHandler(
+            self.rate_handler
+        )
+
+
+        # ====================================================
+        # RESTART RECOVERY
+        # ====================================================
         #
-        # If we're halfway through a batch-cycle,
-        # DO NOT automatically continue sending.
+        # Case 1:
         #
-        # Wait for ,continue.
+        # Halfway through 70-channel cycle
         #
-        # If there is no active batch but auto is enabled,
-        # resume the normal 5-hour scheduler.
-        # -----------------------------------------------------
+        # batch_active = true
+        #
+        # Railway restart
+        #
+        # DO NOTHING automatically.
+        #
+        # Wait for:
+        #
+        # ,continue
+        #
+        #
+        # Case 2:
+        #
+        # Full cycle already completed
+        # and next_run exists
+        #
+        # Restart scheduler.
+        # ====================================================
 
         if (
-            self.data.get("auto")
+
+            self.data.get(
+                "auto"
+            )
+
             and
-            not self.data.get("batch_active")
+
+            not self.data.get(
+                "batch_active"
+            )
+
             and
-            self.data.get("next_run")
+
+            self.data.get(
+                "next_run"
+            )
+
         ):
 
             self._schedule_loop()
 
 
     # ========================================================
-    # LOG CHANNEL
+    # RATE LIMIT FORWARDING
     # ========================================================
 
-    def _get_log_channel(self):
-
-        log_ch = self.bot.get_channel(
-            self.data.get(
-                "log_channel",
-                0
-            )
-        )
-
-        if log_ch is not None:
-            return log_ch
-
-
-        # fallback
-        for guild in self.bot.guilds:
-
-            if guild.text_channels:
-
-                return guild.text_channels[0]
-
-
-        return None
-
-
-    async def _log(self, message):
-
-        log_ch = self._get_log_channel()
-
-        if log_ch:
-
-            try:
-                await log_ch.send(message)
-
-            except Exception as e:
-
-                print(
-                    "AutoPromo log error:",
-                    type(e).__name__,
-                    e
-                )
-
-
-    # ========================================================
-    # CREATE NEW CYCLE
-    # ========================================================
-
-    def _prepare_new_cycle(
+    async def _forward_rate_warning(
         self,
-        reverse: bool
+        warning
     ):
-
-        """
-        Snapshot the channel IDs + promo message.
-
-        This is important.
-
-        If channels.json changes while you're halfway through
-        the batch process, this cycle still knows exactly what
-        channels were originally supposed to be processed.
-        """
-
-        self.data = load_data()
-
-
-        order = list(
-            self.data.get(
-                "channels",
-                []
-            )
-        )
-
-
-        if reverse:
-
-            order.reverse()
-
-
-        channel_ids = []
-
-
-        for entry in order:
-
-            try:
-
-                channel_ids.append(
-                    int(entry["id"])
-                )
-
-            except Exception:
-
-                continue
-
-
-        self.data["batch_active"] = True
-
-        self.data["batch_index"] = 0
-
-        self.data["batch_channel_ids"] = (
-            channel_ids
-        )
-
-        self.data["batch_message"] = (
-            self.data.get("message", "")
-        )
-
-        self.data["batch_reverse"] = reverse
-
-        self.data["batch_started_at"] = (
-            utc_now().isoformat()
-        )
-
-        # While we're waiting for ,continue,
-        # there is no next automatic run yet.
-        self.data["next_run"] = None
-
-        save_data(
-            self.data
-        )
-
-
-    # ========================================================
-    # START COMMON
-    # ========================================================
-
-    async def _common_start(
-        self,
-        ctx: commands.Context,
-        reverse: bool
-    ):
-
-        self.data = load_data()
-
-
-        if not self.data.get("message"):
-
-            return await ctx.send(
-                "⚠️ Set a message first with `,setm …`."
-            )
-
-
-        if not self.data.get("channels"):
-
-            return await ctx.send(
-                "⚠️ Add promo channels with `,setc …` first."
-            )
-
-
-        if self.data.get("batch_active"):
-
-            current = self.data.get(
-                "batch_index",
-                0
-            )
-
-            total = len(
-                self.data.get(
-                    "batch_channel_ids",
-                    []
-                )
-            )
-
-            return await ctx.send(
-                "ℹ️ A promo cycle is already waiting "
-                "for continuation.\n"
-                f"Progress: **{current}/{total}**\n"
-                "Use `,continue`."
-            )
-
-
-        if self.data.get("auto"):
-
-            return await ctx.send(
-                "ℹ️ Auto-cycle is already running."
-            )
-
-
-        self.data["auto"] = True
-
-        self.data["log_channel"] = (
-            ctx.channel.id
-        )
-
-        self.data["reverse"] = reverse
-
-        save_data(
-            self.data
-        )
-
-
-        # Prepare exact cycle snapshot
-        self._prepare_new_cycle(
-            reverse
-        )
-
-
-        await ctx.send(
-            f"✅ Auto-cycle started "
-            f"({'reverse' if reverse else 'forward'}) "
-            f"— sending first **{BATCH_SIZE}** now."
-        )
-
-
-        # Send only first batch.
-        #
-        # After this function completes, the command is DONE.
-        await self._run_next_batch()
-
-
-    # ========================================================
-    # ,start
-    # ========================================================
-
-    @commands.command()
-    async def start(self, ctx):
-
-        """Process channels first→last."""
-
-        await self._common_start(
-            ctx,
-            reverse=False
-        )
-
-
-    # ========================================================
-    # ,startb
-    # ========================================================
-
-    @commands.command()
-    async def startb(self, ctx):
-
-        """Process channels last→first."""
-
-        await self._common_start(
-            ctx,
-            reverse=True
-        )
-
-
-    # ========================================================
-    # ,continue
-    # ========================================================
-
-    @commands.command(name="continue")
-    async def continue_cycle(
-        self,
-        ctx
-    ):
-
-        """
-        Completely separate command.
-
-        Reloads saved batch position and sends next 3.
-        """
-
-        if self.batch_lock.locked():
-
-            return await ctx.send(
-                "⚠️ A batch is already being processed."
-            )
-
-
-        self.data = load_data()
-
-
-        if not self.data.get("auto"):
-
-            return await ctx.send(
-                "ℹ️ Auto-cycle isn't running."
-            )
-
-
-        if not self.data.get("batch_active"):
-
-            return await ctx.send(
-                "ℹ️ There is no cycle waiting "
-                "for `,continue`."
-            )
-
-
-        # Update log location to wherever continue
-        # was invoked.
-        self.data["log_channel"] = (
-            ctx.channel.id
-        )
-
-        save_data(
-            self.data
-        )
-
-
-        await ctx.send(
-            f"▶️ Continuing — sending next "
-            f"**{BATCH_SIZE}** channel(s)."
-        )
-
-
-        # Completely new invocation.
-        await self._run_next_batch()
-
-
-    # ========================================================
-    # ,stop
-    # ========================================================
-
-    @commands.command()
-    async def stop(self, ctx):
-
-        # IMPORTANT:
-        # always reload latest disk data
-        self.data = load_data()
-
-
-        if not self.data.get("auto"):
-
-            return await ctx.send(
-                "ℹ️ Auto-cycle isn’t running."
-            )
-
-
-        self.data["auto"] = False
-
-        self.data["next_run"] = None
-
-
-        # Cancel current batch state too
-        self.data["batch_active"] = False
-
-        self.data["batch_index"] = 0
-
-        self.data["batch_channel_ids"] = []
-
-        self.data["batch_message"] = None
-
-        self.data["batch_started_at"] = None
-
-
-        save_data(
-            self.data
-        )
-
-
-        if (
-            self.loop_task
-            and
-            not self.loop_task.done()
-        ):
-
-            self.loop_task.cancel()
-
-
-        await ctx.send(
-            "🛑 Auto-cycle stopped."
-        )
-
-
-    # ========================================================
-    # SCHEDULING
-    # ========================================================
-
-    def _schedule_loop(self):
-
-        if (
-            self.loop_task
-            and
-            not self.loop_task.done()
-        ):
-
-            self.loop_task.cancel()
-
-
-        self.loop_task = (
-            self.bot.loop.create_task(
-                self._loop()
-            )
-        )
-
-
-    async def _loop(self):
 
         try:
 
-            # -------------------------------------------------
-            # Important:
-            #
-            # This task handles only ONE scheduled wake-up.
-            #
-            # It does NOT sit around waiting for ,continue.
-            # -------------------------------------------------
+            # Keep Discord message under limit
+            if len(warning) > 1500:
 
-            self.data = load_data()
-
-
-            if not self.data.get("auto"):
-
-                return
-
-
-            if self.data.get("batch_active"):
-
-                # Waiting for manual ,continue
-                return
-
-
-            next_run = self.data.get(
-                "next_run"
-            )
-
-
-            if not next_run:
-
-                return
-
-
-            delay = max(
-                0,
-                (
-                    datetime.fromisoformat(
-                        next_run
-                    )
-                    - utc_now()
-                ).total_seconds()
-            )
-
-
-            await asyncio.sleep(
-                delay
-            )
-
-
-            self.data = load_data()
-
-
-            if not self.data.get("auto"):
-
-                return
-
-
-            if self.data.get("batch_active"):
-
-                return
-
-
-            # ================================================
-            # NEW 5-HOUR CYCLE
-            # ================================================
-
-            reverse = bool(
-                self.data.get(
-                    "reverse",
-                    False
-                )
-            )
-
-
-            self._prepare_new_cycle(
-                reverse
-            )
+                warning = warning[:1500]
 
 
             await self._log(
-                f"⏰ Scheduled cycle started "
-                f"({'reverse' if reverse else 'forward'}) "
-                f"— first {BATCH_SIZE} channels."
+
+                "🚨 **Discord rate limit detected**\n"
+                f"```text\n{warning}\n```\n"
+                "The active send may be stopped by the "
+                "batch timeout instead of waiting for hours.\n"
+                "Do **not** repeatedly retry immediately; "
+                "Discord's rate limit still applies."
+
             )
-
-
-            # Send first 3 only.
-            await self._run_next_batch()
-
-
-            # Then this loop task ENDS.
-            #
-            # If more remain, ,continue is required.
-            # If the entire cycle finished, _run_next_batch()
-            # schedules the next 5-hour wakeup.
-
-
-        except asyncio.CancelledError:
-
-            pass
 
 
         except Exception as e:
 
             print(
-                "AutoPromo loop error:",
+                "Rate warning forward failed:",
+                type(e).__name__,
+                e
+            )
+
+
+        finally:
+
+            self._forwarding_rate_log = False
+
+
+    # ========================================================
+    # LOG CHANNEL
+    # ========================================================
+
+    def _get_log_channel(
+        self
+    ):
+
+        # First try the saved log channel
+        log_ch = self.bot.get_channel(
+
+            self.data.get(
+                "log_channel",
+                0
+            )
+
+        )
+
+
+        if log_ch is not None:
+
+            return log_ch
+
+
+        # Then try your dedicated control channel
+        control = self.bot.get_channel(
+            CONTROL_CHANNEL_ID
+        )
+
+
+        if control is not None:
+
+            return control
+
+
+        # Final fallback
+        for guild in self.bot.guilds:
+
+            if guild.text_channels:
+
+                return guild.text_channels[
+                    0
+                ]
+
+
+        return None
+
+
+    async def _log(
+        self,
+        message
+    ):
+
+        log_ch = (
+            self._get_log_channel()
+        )
+
+
+        if not log_ch:
+
+            return
+
+
+        try:
+
+            await log_ch.send(
+                message
+            )
+
+
+        except Exception as e:
+
+            print(
+                "AutoPromo log error:",
                 type(e).__name__,
                 e
             )
 
 
     # ========================================================
-    # GET ENTRY FROM LIVE CHANNEL DATA
+    # CONTROL CHANNEL CHECK
+    # ========================================================
+
+    def _in_control_channel(
+        self,
+        channel
+    ):
+
+        try:
+
+            return (
+                channel.id
+                ==
+                CONTROL_CHANNEL_ID
+            )
+
+
+        except Exception:
+
+            return False
+
+
+    # ========================================================
+    # FIND CHANNEL ENTRY
     # ========================================================
 
     def _find_channel_entry(
@@ -649,6 +607,7 @@ class AutoPromo(commands.Cog):
 
                     return entry
 
+
             except Exception:
 
                 continue
@@ -658,45 +617,984 @@ class AutoPromo(commands.Cog):
 
 
     # ========================================================
-    # RUN NEXT BATCH
+    # PREPARE NEW CYCLE
     # ========================================================
 
-    async def _run_next_batch(self):
+    def _prepare_new_cycle(
+        self,
+        reverse: bool
+    ):
+
+        self.data = load_data()
+
+
+        order = list(
+
+            self.data.get(
+                "channels",
+                []
+            )
+
+        )
+
+
+        if reverse:
+
+            order.reverse()
+
+
+        channel_ids = []
+
+
+        for entry in order:
+
+            try:
+
+                channel_ids.append(
+
+                    int(
+                        entry["id"]
+                    )
+
+                )
+
+
+            except Exception:
+
+                continue
+
+
+        # ====================================================
+        # SNAPSHOT THIS PARTICULAR CYCLE
+        # ====================================================
+
+        self.data[
+            "batch_active"
+        ] = True
+
+
+        self.data[
+            "batch_index"
+        ] = 0
+
+
+        self.data[
+            "batch_attempt_start"
+        ] = 0
+
+
+        self.data[
+            "batch_channel_ids"
+        ] = channel_ids
+
+
+        self.data[
+            "batch_message"
+        ] = self.data.get(
+            "message",
+            ""
+        )
+
+
+        self.data[
+            "batch_reverse"
+        ] = reverse
+
+
+        self.data[
+            "batch_started_at"
+        ] = utc_now().isoformat()
+
+
+        self.data[
+            "batch_last_error"
+        ] = None
+
+
+        # While we're between batches there is
+        # no automatic next_run yet.
+        self.data[
+            "next_run"
+        ] = None
+
+
+        save_data(
+            self.data
+        )
+
+
+    # ========================================================
+    # START COMMON
+    # ========================================================
+
+    async def _common_start(
+        self,
+        ctx: commands.Context,
+        reverse: bool
+    ):
+
+        self.data = load_data()
+
+
+        if not self.data.get(
+            "message"
+        ):
+
+            return await ctx.send(
+
+                "⚠️ Set a message first "
+                "with `,setm …`."
+
+            )
+
+
+        if not self.data.get(
+            "channels"
+        ):
+
+            return await ctx.send(
+
+                "⚠️ Add promo channels "
+                "with `,setc …` first."
+
+            )
+
+
+        if self.data.get(
+            "batch_active"
+        ):
+
+            current = int(
+
+                self.data.get(
+                    "batch_index",
+                    0
+                )
+
+            )
+
+
+            total = len(
+
+                self.data.get(
+                    "batch_channel_ids",
+                    []
+                )
+
+            )
+
+
+            return await ctx.send(
+
+                "ℹ️ A promo cycle is already active.\n"
+
+                f"Progress: **{current}/{total}**\n\n"
+
+                f"Use `,continue` in "
+                f"<#{CONTROL_CHANNEL_ID}>."
+
+            )
+
+
+        if self.data.get(
+            "auto"
+        ):
+
+            return await ctx.send(
+
+                "ℹ️ Auto-cycle is already running."
+
+            )
+
+
+        self.data[
+            "auto"
+        ] = True
+
+
+        self.data[
+            "log_channel"
+        ] = ctx.channel.id
+
+
+        self.data[
+            "reverse"
+        ] = reverse
+
+
+        save_data(
+            self.data
+        )
+
+
+        self._prepare_new_cycle(
+            reverse
+        )
+
+
+        await ctx.send(
+
+            f"✅ Auto-cycle started "
+            f"({'reverse' if reverse else 'forward'}) "
+            f"— first **{BATCH_SIZE}** channels now."
+
+        )
+
+
+        # ====================================================
+        # IMPORTANT
+        #
+        # Executes first 3.
+        #
+        # _run_next_batch RETURNS afterward.
+        #
+        # There is NO wait_for().
+        # There is NO command waiting for ,continue.
+        # ====================================================
+
+        await self._run_next_batch()
+
+
+    # ========================================================
+    # ,start
+    # ========================================================
+
+    @commands.command()
+    async def start(
+        self,
+        ctx
+    ):
+
+        """Process channels first→last."""
+
+        await self._common_start(
+
+            ctx,
+
+            reverse=False
+
+        )
+
+
+    # ========================================================
+    # ,startb
+    # ========================================================
+
+    @commands.command()
+    async def startb(
+        self,
+        ctx
+    ):
+
+        """Process channels last→first."""
+
+        await self._common_start(
+
+            ctx,
+
+            reverse=True
+
+        )
+
+
+    # ========================================================
+    # INTERNAL CONTINUE
+    # ========================================================
+
+    async def _handle_continue(
+        self,
+        ctx,
+        *,
+        replay=False
+    ):
+
+        # ====================================================
+        # ONLY THIS CHANNEL
+        # ====================================================
+
+        if not self._in_control_channel(
+            ctx.channel
+        ):
+
+            return
+
+
+        if self.batch_lock.locked():
+
+            return await ctx.send(
+
+                "⚠️ A 3-channel batch is "
+                "already processing."
+
+            )
+
+
+        self.data = load_data()
+
+
+        if not self.data.get(
+            "auto"
+        ):
+
+            return await ctx.send(
+
+                "ℹ️ Auto-cycle isn't running."
+
+            )
+
+
+        if not self.data.get(
+            "batch_active"
+        ):
+
+            return await ctx.send(
+
+                "ℹ️ There is no unfinished cycle."
+
+            )
+
+
+        total = len(
+
+            self.data.get(
+                "batch_channel_ids",
+                []
+            )
+
+        )
+
+
+        current = int(
+
+            self.data.get(
+                "batch_index",
+                0
+            )
+
+        )
+
+
+        # ====================================================
+        # RECONTINUE
+        # ====================================================
+
+        if replay:
+
+            retry_start = int(
+
+                self.data.get(
+                    "batch_attempt_start",
+                    current
+                )
+
+            )
+
+
+            retry_start = max(
+                0,
+                min(
+                    retry_start,
+                    total
+                )
+            )
+
+
+            self.data[
+                "batch_index"
+            ] = retry_start
+
+
+            self.data[
+                "batch_last_error"
+            ] = None
+
+
+            save_data(
+                self.data
+            )
+
+
+            await ctx.send(
+
+                "🔁 **Recontinue**\n"
+                f"Replaying the current batch from "
+                f"channel **{retry_start + 1}**.\n"
+                f"Sending maximum **{BATCH_SIZE}** channels."
+
+            )
+
+
+        else:
+
+            await ctx.send(
+
+                "▶️ **Continue**\n"
+                f"Resuming from channel "
+                f"**{current + 1}**.\n"
+                f"Sending maximum **{BATCH_SIZE}** channels."
+
+            )
+
+
+        # New command execution.
+        await self._run_next_batch()
+
+
+    # ========================================================
+    # ,continue
+    # ========================================================
+
+    @commands.command(
+        name="continue"
+    )
+    async def continue_cycle(
+        self,
+        ctx
+    ):
 
         """
-        Sends AT MOST BATCH_SIZE channels.
+        For your own message.
 
-        Then:
-
-        • saves exact next index
-        • prints ,continue message
-        • RETURNS COMPLETELY
-
-        No wait_for().
-        No waiting coroutine.
+        Other users are handled by on_message below.
         """
 
-        async with self.batch_lock:
+        # Wrong channel = no action.
+        if not self._in_control_channel(
+            ctx.channel
+        ):
 
-            # Always reload latest data
-            self.data = load_data()
+            return
 
 
-            if not self.data.get("auto"):
+        # If message is from somebody else,
+        # listener below handles it.
+        #
+        # This prevents duplicate execution when
+        # commands.process_commands also sees it.
+        if (
+
+            self.bot.user
+
+            and
+
+            ctx.author.id
+            !=
+            self.bot.user.id
+
+        ):
+
+            return
+
+
+        await self._handle_continue(
+
+            ctx,
+
+            replay=False
+
+        )
+
+
+    # ========================================================
+    # ,recontinue
+    # ========================================================
+
+    @commands.command(
+        name="recontinue"
+    )
+    async def recontinue_cycle(
+        self,
+        ctx
+    ):
+
+        """
+        Replay current 3-channel block.
+        """
+
+        if not self._in_control_channel(
+            ctx.channel
+        ):
+
+            return
+
+
+        if (
+
+            self.bot.user
+
+            and
+
+            ctx.author.id
+            !=
+            self.bot.user.id
+
+        ):
+
+            return
+
+
+        await self._handle_continue(
+
+            ctx,
+
+            replay=True
+
+        )
+
+
+    # ========================================================
+    # LISTENER
+    #
+    # This allows OTHER PEOPLE to trigger these two commands
+    # in your dedicated channel even if main.py has your
+    # normal "only respond to myself" global command check.
+    # ========================================================
+
+    @commands.Cog.listener()
+    async def on_message(
+        self,
+        message: discord.Message
+    ):
+
+        try:
+
+            # Only dedicated channel
+            if message.channel.id != (
+                CONTROL_CHANNEL_ID
+            ):
 
                 return
 
 
-            if not self.data.get("batch_active"):
+            # Your own messages are handled through
+            # the normal command framework.
+            if (
+
+                self.bot.user
+
+                and
+
+                message.author.id
+                ==
+                self.bot.user.id
+
+            ):
+
+                return
+
+
+            content = (
+                message.content
+                or ""
+            ).strip().lower()
+
+
+            if content not in {
+
+                ",continue",
+
+                ",recontinue"
+
+            }:
+
+                return
+
+
+            # Build context manually.
+            ctx = await self.bot.get_context(
+                message
+            )
+
+
+            if content == ",continue":
+
+                await self._handle_continue(
+
+                    ctx,
+
+                    replay=False
+
+                )
+
+
+            elif content == ",recontinue":
+
+                await self._handle_continue(
+
+                    ctx,
+
+                    replay=True
+
+                )
+
+
+        except Exception as e:
+
+            print(
+
+                "External continue listener error:",
+
+                type(e).__name__,
+
+                e
+
+            )
+
+
+    # ========================================================
+    # ,stop
+    # ========================================================
+
+    @commands.command()
+    async def stop(
+        self,
+        ctx
+    ):
+
+        # Always reload newest JSON
+        self.data = load_data()
+
+
+        if not self.data.get(
+            "auto"
+        ):
+
+            return await ctx.send(
+
+                "ℹ️ Auto-cycle isn’t running."
+
+            )
+
+
+        self.data[
+            "auto"
+        ] = False
+
+
+        self.data[
+            "next_run"
+        ] = None
+
+
+        self.data[
+            "batch_active"
+        ] = False
+
+
+        self.data[
+            "batch_index"
+        ] = 0
+
+
+        self.data[
+            "batch_attempt_start"
+        ] = 0
+
+
+        self.data[
+            "batch_channel_ids"
+        ] = []
+
+
+        self.data[
+            "batch_message"
+        ] = None
+
+
+        self.data[
+            "batch_started_at"
+        ] = None
+
+
+        self.data[
+            "batch_last_error"
+        ] = None
+
+
+        save_data(
+            self.data
+        )
+
+
+        if (
+
+            self.loop_task
+
+            and
+
+            not self.loop_task.done()
+
+        ):
+
+            self.loop_task.cancel()
+
+
+        await ctx.send(
+
+            "🛑 Auto-cycle stopped."
+
+        )
+
+
+    # ========================================================
+    # SCHEDULING
+    # ========================================================
+
+    def _schedule_loop(
+        self
+    ):
+
+        if (
+
+            self.loop_task
+
+            and
+
+            not self.loop_task.done()
+
+        ):
+
+            self.loop_task.cancel()
+
+
+        self.loop_task = (
+
+            self.bot.loop.create_task(
+
+                self._loop()
+
+            )
+
+        )
+
+
+    # ========================================================
+    # 5-HOUR SCHEDULER
+    # ========================================================
+
+    async def _loop(
+        self
+    ):
+
+        try:
+
+            self.data = load_data()
+
+
+            if not self.data.get(
+                "auto"
+            ):
+
+                return
+
+
+            # Half-finished batch exists.
+            #
+            # Do NOT automatically continue.
+            if self.data.get(
+                "batch_active"
+            ):
+
+                return
+
+
+            next_run = self.data.get(
+                "next_run"
+            )
+
+
+            if not next_run:
+
+                return
+
+
+            delay = max(
+
+                0,
+
+                (
+
+                    datetime.fromisoformat(
+                        next_run
+                    )
+
+                    -
+
+                    utc_now()
+
+                ).total_seconds()
+
+            )
+
+
+            await asyncio.sleep(
+                delay
+            )
+
+
+            # Fresh state after sleeping
+            self.data = load_data()
+
+
+            if not self.data.get(
+                "auto"
+            ):
+
+                return
+
+
+            if self.data.get(
+                "batch_active"
+            ):
+
+                return
+
+
+            reverse = bool(
+
+                self.data.get(
+                    "reverse",
+                    False
+                )
+
+            )
+
+
+            self._prepare_new_cycle(
+                reverse
+            )
+
+
+            await self._log(
+
+                f"⏰ Scheduled cycle started "
+                f"({'reverse' if reverse else 'forward'}) "
+                f"— sending first "
+                f"**{BATCH_SIZE}** channels."
+
+            )
+
+
+            # =================================================
+            # FIRST 3 ONLY
+            #
+            # Then _loop itself ends.
+            # =================================================
+
+            await self._run_next_batch()
+
+
+            return
+
+
+        except asyncio.CancelledError:
+
+            pass
+
+
+        except Exception as e:
+
+            print(
+
+                "AutoPromo loop error:",
+
+                type(e).__name__,
+
+                e
+
+            )
+
+
+    # ========================================================
+    # SAVE CURRENT ERROR WITHOUT DESTROYING NEWER JSON DATA
+    # ========================================================
+
+    def _save_batch_error(
+        self,
+        position,
+        error_text
+    ):
+
+        self.data = load_data()
+
+
+        # DO NOT advance index.
+        #
+        # This means regular ,continue resumes
+        # at this same failed channel.
+        self.data[
+            "batch_index"
+        ] = position
+
+
+        self.data[
+            "batch_last_error"
+        ] = error_text
+
+
+        save_data(
+            self.data
+        )
+
+
+    # ========================================================
+    # RUN ONE 3-CHANNEL BATCH
+    # ========================================================
+
+    async def _run_next_batch(
+        self
+    ):
+
+        """
+        IMPORTANT ARCHITECTURE:
+
+        ONE invocation
+            ↓
+        sends max 3
+            ↓
+        saves position
+            ↓
+        RETURNS
+
+        There is NO:
+
+            wait_for(",continue")
+
+        There is NO:
+
+            while waiting for user
+
+        There is NO sleeping task waiting for the next batch.
+
+        ,continue is an entirely new Discord command execution.
+        """
+
+        async with self.batch_lock:
+
+            self.data = load_data()
+
+
+            if not self.data.get(
+                "auto"
+            ):
+
+                return
+
+
+            if not self.data.get(
+                "batch_active"
+            ):
 
                 return
 
 
             channel_ids = list(
+
                 self.data.get(
                     "batch_channel_ids",
                     []
                 )
+
             )
 
 
@@ -706,44 +1604,66 @@ class AutoPromo(commands.Cog):
 
 
             index = int(
+
                 self.data.get(
                     "batch_index",
                     0
                 )
+
             )
 
 
             promo = (
+
                 self.data.get(
                     "batch_message"
                 )
+
                 or
+
                 self.data.get(
                     "message",
                     ""
                 )
+
             )
 
 
             reverse = bool(
+
                 self.data.get(
                     "batch_reverse",
                     False
                 )
+
             )
 
 
-            # ================================================
-            # CORRUPT / EMPTY STATE
-            # ================================================
+            # =================================================
+            # INVALID STATE
+            # =================================================
 
             if total == 0:
 
-                self.data["batch_active"] = False
+                self.data[
+                    "batch_active"
+                ] = False
 
-                self.data["batch_index"] = 0
 
-                self.data["batch_channel_ids"] = []
+                self.data[
+                    "batch_index"
+                ] = 0
+
+
+                self.data[
+                    "batch_attempt_start"
+                ] = 0
+
+
+                self.data[
+                    "batch_channel_ids"
+                ] = []
+
 
                 save_data(
                     self.data
@@ -751,55 +1671,92 @@ class AutoPromo(commands.Cog):
 
 
                 await self._log(
+
                     "⚠️ Batch contained no channels."
+
+                )
+
+
+                return
+
+
+            if index >= total:
+
+                await self._finish_cycle(
+                    total
                 )
 
                 return
 
 
-            # ================================================
-            # BATCH RANGE
-            # ================================================
+            # =================================================
+            # DEFINE THIS EXACT BLOCK
+            # =================================================
 
             start_index = index
 
+
             end_index = min(
-                index + BATCH_SIZE,
+
+                start_index
+                +
+                BATCH_SIZE,
+
                 total
+
+            )
+
+
+            # Store beginning of THIS command's batch.
+            #
+            # This is what ,recontinue will return to.
+            self.data[
+                "batch_attempt_start"
+            ] = start_index
+
+
+            self.data[
+                "batch_last_error"
+            ] = None
+
+
+            save_data(
+                self.data
             )
 
 
             await self._log(
+
                 f"▶️ Batch started "
-                f"({'reverse' if reverse else 'forward'}) "
-                f"— channels "
+                f"({'reverse' if reverse else 'forward'})\n"
+                f"Channels "
                 f"**{start_index + 1}-{end_index}** "
-                f"of **{total}**"
+                f"of **{total}**."
+
             )
 
 
-            # ================================================
-            # SEND THIS BATCH ONLY
-            # ================================================
+            # =================================================
+            # PROCESS MAXIMUM 3
+            # =================================================
 
             for position in range(
+
                 start_index,
+
                 end_index
+
             ):
 
                 channel_id = (
-                    channel_ids[position]
+                    channel_ids[
+                        position
+                    ]
                 )
 
 
-                # Refresh current JSON before each send
-                # so we don't intentionally overwrite newer
-                # changes from another cog.
-                latest = load_data()
-
-
-                # Keep our current batch fields
-                self.data = latest
+                # Refresh disk before each channel
+                self.data = load_data()
 
 
                 chan = self.bot.get_channel(
@@ -807,77 +1764,126 @@ class AutoPromo(commands.Cog):
                 )
 
 
-                entry = self._find_channel_entry(
-                    channel_id
+                entry = (
+                    self._find_channel_entry(
+                        channel_id
+                    )
                 )
 
+
+                # =============================================
+                # MISSING CHANNEL
+                # =============================================
 
                 if chan is None:
 
                     channel_name = (
+
                         entry.get(
                             "channel_name",
                             str(channel_id)
                         )
+
                         if entry
-                        else str(channel_id)
+
+                        else
+
+                        str(channel_id)
+
                     )
 
 
                     await self._log(
+
                         f"⏩ `{channel_name}` missing"
+
                     )
 
 
-                    # This position counts as processed.
-                    self.data["batch_index"] = (
-                        position + 1
-                    )
+                    # Missing = processed/skipped.
+                    self.data[
+                        "batch_index"
+                    ] = position + 1
+
 
                     save_data(
                         self.data
                     )
 
+
                     continue
 
 
-                # ============================================
+                # =============================================
                 # SEND
-                # ============================================
+                # =============================================
+
+                sent = False
+
 
                 for attempt in range(
+
                     1,
+
                     MAX_RETRIES + 2
+
                 ):
 
                     try:
 
-                        await chan.send(
-                            promo
+                        # =====================================
+                        # CRITICAL:
+                        #
+                        # discord.py can internally sit on a
+                        # 429 for hours.
+                        #
+                        # asyncio.wait_for prevents THIS batch
+                        # command from staying alive forever.
+                        # =====================================
+
+                        await asyncio.wait_for(
+
+                            chan.send(
+                                promo
+                            ),
+
+                            timeout=SEND_TIMEOUT
+
                         )
 
 
-                        # Reload newest file BEFORE storing
-                        # last_sent.
+                        # =====================================
+                        # SUCCESS
+                        # =====================================
+
                         self.data = load_data()
 
 
-                        entry = self._find_channel_entry(
-                            channel_id
+                        entry = (
+                            self._find_channel_entry(
+                                channel_id
+                            )
                         )
 
 
                         if entry is not None:
 
-                            entry["last_sent"] = (
+                            entry[
+                                "last_sent"
+                            ] = (
                                 utc_now().isoformat()
                             )
 
 
-                        # Record exact next position
-                        self.data["batch_index"] = (
-                            position + 1
-                        )
+                        # Exact next position
+                        self.data[
+                            "batch_index"
+                        ] = position + 1
+
+
+                        self.data[
+                            "batch_last_error"
+                        ] = None
 
 
                         save_data(
@@ -886,38 +1892,178 @@ class AutoPromo(commands.Cog):
 
 
                         await self._log(
+
                             f"✅ [{attempt}] "
                             f"{chan.guild.name}/"
                             f"#{chan.name}"
+
                         )
 
+
+                        sent = True
 
                         break
 
 
+                    # =========================================
+                    # INTERNAL 429 / SEND HANG
+                    # =========================================
+
+                    except asyncio.TimeoutError:
+
+                        error_text = (
+
+                            f"Send timed out after "
+                            f"{SEND_TIMEOUT}s on "
+                            f"{chan.guild.name}/"
+                            f"#{chan.name}"
+
+                        )
+
+
+                        self._save_batch_error(
+
+                            position,
+
+                            error_text
+
+                        )
+
+
+                        await self._log(
+
+                            "🚨 **Batch stopped**\n\n"
+
+                            f"Channel: "
+                            f"**{position + 1}/{total}**\n"
+
+                            f"Server: "
+                            f"**{chan.guild.name}**\n"
+
+                            f"Channel: "
+                            f"`#{chan.name}`\n\n"
+
+                            f"`chan.send()` did not complete "
+                            f"within **{SEND_TIMEOUT}s**.\n"
+
+                            "Discord may currently be "
+                            "rate-limiting this send.\n\n"
+
+                            f"Progress remains at "
+                            f"**{position}/{total}**.\n\n"
+
+                            "`,continue` = resume from this "
+                            "failed channel\n"
+
+                            "`,recontinue` = replay this whole "
+                            "3-channel batch"
+
+                        )
+
+
+                        # =====================================
+                        # COMMAND ENDS RIGHT NOW
+                        # =====================================
+
+                        return
+
+
+                    # =========================================
+                    # HTTP EXCEPTION
+                    # =========================================
+
                     except discord.HTTPException as e:
 
-                        if attempt <= MAX_RETRIES:
+                        wait = max(
 
-                            wait = max(
-                                RETRY_DELAY,
-                                int(
-                                    getattr(
-                                        e,
-                                        "retry_after",
-                                        RETRY_DELAY
-                                    )
+                            RETRY_DELAY,
+
+                            int(
+
+                                getattr(
+
+                                    e,
+
+                                    "retry_after",
+
+                                    RETRY_DELAY
+
                                 )
+
+                            )
+
+                        )
+
+
+                        # Long rate limit:
+                        # DON'T leave command sleeping.
+                        if wait > (
+                            MAX_INLINE_RETRY_WAIT
+                        ):
+
+                            error_text = (
+
+                                f"Discord requested "
+                                f"{wait}s retry wait on "
+                                f"{chan.guild.name}/"
+                                f"#{chan.name}"
+
+                            )
+
+
+                            self._save_batch_error(
+
+                                position,
+
+                                error_text
+
                             )
 
 
                             await self._log(
+
+                                "🚨 **Long Discord rate limit**\n\n"
+
+                                f"Channel: "
+                                f"**{position + 1}/{total}**\n"
+
+                                f"Server: "
+                                f"**{chan.guild.name}**\n"
+
+                                f"Channel: "
+                                f"`#{chan.name}`\n"
+
+                                f"Retry-after: "
+                                f"**{wait}s**\n\n"
+
+                                "This batch command is ending "
+                                "instead of sleeping for hours.\n\n"
+
+                                "`,continue` resumes here later.\n"
+
+                                "`,recontinue` replays this "
+                                "3-channel block."
+
+                            )
+
+
+                            return
+
+
+                        # Short normal retry
+                        if attempt <= (
+                            MAX_RETRIES
+                        ):
+
+                            await self._log(
+
                                 f"⚠️ Rate-limit on "
                                 f"{chan.guild.name}/"
                                 f"#{chan.name} "
                                 f"– retry in {wait}s "
                                 f"({attempt}/"
                                 f"{MAX_RETRIES + 1})"
+
                             )
 
 
@@ -928,124 +2074,160 @@ class AutoPromo(commands.Cog):
 
                         else:
 
+                            error_text = (
+
+                                f"Give-up after "
+                                f"{MAX_RETRIES + 1} attempts "
+                                f"on {chan.guild.name}/"
+                                f"#{chan.name}"
+
+                            )
+
+
+                            self._save_batch_error(
+
+                                position,
+
+                                error_text
+
+                            )
+
+
                             await self._log(
+
                                 f"❌ Give-up "
                                 f"{chan.guild.name}/"
-                                f"#{chan.name}"
+                                f"#{chan.name}\n\n"
+
+                                "Batch stopped at this channel.\n"
+
+                                "Use `,continue` later or "
+                                "`,recontinue` to replay "
+                                "the current batch."
+
                             )
 
 
-                            # Count it as processed so
-                            # ,continue does not loop forever
-                            # on this exact channel.
-                            self.data = load_data()
+                            return
 
-                            self.data[
-                                "batch_index"
-                            ] = position + 1
 
-                            save_data(
-                                self.data
-                            )
-
+                    # =========================================
+                    # GENERIC ERROR
+                    # =========================================
 
                     except Exception as e:
 
+                        error_text = (
+
+                            f"{type(e).__name__}: {e}"
+
+                        )
+
+
+                        self._save_batch_error(
+
+                            position,
+
+                            error_text
+
+                        )
+
+
                         await self._log(
-                            f"❌ Error "
+
+                            "❌ **Batch error**\n\n"
+
+                            f"Channel: "
+                            f"**{position + 1}/{total}**\n"
+
                             f"{chan.guild.name}/"
-                            f"#{chan.name}: {e}"
+                            f"#{chan.name}\n\n"
+
+                            f"`{type(e).__name__}: {e}`\n\n"
+
+                            "`,continue` resumes from this "
+                            "channel.\n"
+
+                            "`,recontinue` replays the current "
+                            "3-channel block."
+
                         )
 
 
-                        # Count failed channel as processed.
-                        self.data = load_data()
-
-                        self.data[
-                            "batch_index"
-                        ] = position + 1
-
-                        save_data(
-                            self.data
-                        )
+                        return
 
 
-                        break
+                # =============================================
+                # BETWEEN CHANNELS
+                # =============================================
 
+                if (
 
-                # Only delay BETWEEN channels in this batch
-                if position < end_index - 1:
+                    sent
+
+                    and
+
+                    position
+                    <
+                    end_index - 1
+
+                ):
 
                     await asyncio.sleep(
                         SEND_DELAY
                     )
 
 
-            # ================================================
-            # RELOAD FINAL POSITION
-            # ================================================
+            # =================================================
+            # BATCH IS DONE
+            # =================================================
 
             self.data = load_data()
 
 
             current = int(
+
                 self.data.get(
                     "batch_index",
                     0
                 )
+
             )
 
 
-            # ================================================
-            # FULL CYCLE FINISHED
-            # ================================================
+            # =================================================
+            # ALL CHANNELS FINISHED
+            # =================================================
 
             if current >= total:
 
-                self.data["batch_active"] = False
-
-                self.data["batch_index"] = 0
-
-                self.data["batch_channel_ids"] = []
-
-                self.data["batch_message"] = None
-
-                self.data["batch_started_at"] = None
-
-
-                # Schedule NEXT full cycle
-                self.data["next_run"] = (
-                    utc_now()
-                    + timedelta(
-                        hours=CYCLE_HOURS
-                    )
-                ).isoformat()
-
-
-                save_data(
-                    self.data
+                await self._finish_cycle(
+                    total
                 )
-
-
-                await self._log(
-                    "🏁 **Cycle finished**\n"
-                    f"Processed: **{total}/{total}**\n"
-                    f"Next automatic cycle in "
-                    f"**{CYCLE_HOURS} hours**."
-                )
-
-
-                # Start ONE sleeping scheduler task
-                # for the next cycle.
-                self._schedule_loop()
-
 
                 return
 
 
-            # ================================================
-            # MORE CHANNELS REMAIN
-            # ================================================
+            # =================================================
+            # PREPARE NEXT SEPARATE COMMAND
+            # =================================================
+
+            # Current next index becomes beginning of
+            # next batch.
+            self.data[
+                "batch_attempt_start"
+            ] = current
+
+
+            self.data[
+                "batch_last_error"
+            ] = None
+
+
+            save_data(
+                self.data
+            )
+
 
             remaining = (
                 total - current
@@ -1053,54 +2235,184 @@ class AutoPromo(commands.Cog):
 
 
             next_end = min(
-                current + BATCH_SIZE,
+
+                current
+                +
+                BATCH_SIZE,
+
                 total
+
             )
 
 
             await self._log(
-                "⏸️ **Batch finished**\n\n"
-                f"Processed: **{current}/{total}**\n"
-                f"Remaining: **{remaining}**\n\n"
-                f"Next batch: channels "
+
+                "⏸️ **Batch finished — process ended**\n\n"
+
+                f"Processed: "
+                f"**{current}/{total}**\n"
+
+                f"Remaining: "
+                f"**{remaining}**\n\n"
+
+                f"Next batch: "
                 f"**{current + 1}-{next_end}**\n\n"
-                "Use `,continue` to send the next batch."
+
+                f"Use `,continue` in "
+                f"<#{CONTROL_CHANNEL_ID}>.\n\n"
+
+                "This command is now completely finished. "
+                "Nothing is waiting for the next command."
+
             )
 
 
+            # =================================================
             # IMPORTANT:
             #
-            # FUNCTION ENDS HERE.
+            # RETURN.
             #
-            # Nothing is waiting for ,continue.
-            # No wait_for().
-            # No infinite pause.
+            # No wait_for()
+            # No pending continue task
+            # No loop waiting for input
             #
-            # A future ,continue command creates an entirely
-            # new command invocation.
+            # "delivery guy disappears"
+            # =================================================
+
+            return
+
+
+    # ========================================================
+    # FINISH COMPLETE CYCLE
+    # ========================================================
+
+    async def _finish_cycle(
+        self,
+        total
+    ):
+
+        self.data = load_data()
+
+
+        self.data[
+            "batch_active"
+        ] = False
+
+
+        self.data[
+            "batch_index"
+        ] = 0
+
+
+        self.data[
+            "batch_attempt_start"
+        ] = 0
+
+
+        self.data[
+            "batch_channel_ids"
+        ] = []
+
+
+        self.data[
+            "batch_message"
+        ] = None
+
+
+        self.data[
+            "batch_started_at"
+        ] = None
+
+
+        self.data[
+            "batch_last_error"
+        ] = None
+
+
+        self.data[
+            "next_run"
+        ] = (
+
+            utc_now()
+
+            +
+
+            timedelta(
+                hours=CYCLE_HOURS
+            )
+
+        ).isoformat()
+
+
+        save_data(
+            self.data
+        )
+
+
+        await self._log(
+
+            "🏁 **Cycle finished**\n\n"
+
+            f"Processed: **{total}/{total}**\n"
+
+            f"Next automatic cycle in "
+            f"**{CYCLE_HOURS} hours**."
+
+        )
+
+
+        # One lightweight scheduler is needed only
+        # for the next 5-hour automatic cycle.
+        self._schedule_loop()
 
 
     # ========================================================
     # UNLOAD
     # ========================================================
 
-    def cog_unload(self):
+    def cog_unload(
+        self
+    ):
 
+        # Stop scheduler
         if (
+
             self.loop_task
+
             and
+
             not self.loop_task.done()
+
         ):
 
             self.loop_task.cancel()
+
+
+        # Remove our logger handler
+        try:
+
+            self.http_logger.removeHandler(
+                self.rate_handler
+            )
+
+
+        except Exception:
+
+            pass
 
 
 # ============================================================
 # SETUP
 # ============================================================
 
-async def setup(bot):
+async def setup(
+    bot
+):
 
     await bot.add_cog(
-        AutoPromo(bot)
+
+        AutoPromo(
+            bot
+        )
+
     )
