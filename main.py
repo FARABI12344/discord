@@ -1,38 +1,53 @@
 import os
 import asyncio
+
 import discord
 from discord.ext import commands
+
 
 # ============================================================
 # CONFIG
 # ============================================================
 
-# Load tokens from tokens.txt if no single token is provided via env var
-TOKENS_FILE = "tokens.txt"
-TOKENS = []
-
-if os.path.exists(TOKENS_FILE):
-    with open(TOKENS_FILE, "r") as f:
-        TOKENS = [line.strip() for line in f if line.strip()]
-
-if not TOKENS:
-    # Fallback to single env var for backward compatibility if no file
-    TOKENS = [os.getenv("DISCORD_TOKEN", "")]
-
-if not TOKENS or not TOKENS[0]:
-    raise RuntimeError(
-        "No tokens found. Add 'DISCORD_TOKEN' env var or create 'tokens.txt' with one token per line."
-    )
-
 COGS_FOLDER = "./cogs"
 COMMAND_PREFIX = ","
+
+
+# ============================================================
+# LOAD TOKENS
+# ============================================================
+
+# Try to get tokens from environment variables
+TOKEN_1 = os.getenv("DISCORD_TOKEN", "")
+TOKEN_2 = os.getenv("DISCORD_TOKEN_2", "")
+
+# Fallback: if env var is empty, you can hardcode them here as a backup
+# TOKEN_1 = "your_first_token_here"
+# TOKEN_2 = "your_second_token_here"
+
+TOKENS = []
+if TOKEN_1:
+    TOKENS.append(TOKEN_1)
+if TOKEN_2:
+    TOKENS.append(TOKEN_2)
+
+if not TOKENS:
+    raise RuntimeError(
+        "No tokens found. "
+        "Set 'DISCORD_TOKEN' and/or 'DISCORD_TOKEN_2' "
+        "environment variables."
+    )
+
 
 # ============================================================
 # BOT FACTORY
 # ============================================================
 
 def create_bot_instance(token):
-    """Creates a new Bot instance with all event handlers and commands."""
+    """
+    Creates a new Bot instance with all event handlers and commands.
+    This allows us to run multiple bots with the exact same logic.
+    """
     bot = commands.Bot(
         command_prefix=COMMAND_PREFIX,
         self_bot=True,
@@ -57,6 +72,7 @@ def create_bot_instance(token):
 
     async def load_all_cogs():
         results = []
+
         os.makedirs(COGS_FOLDER, exist_ok=True)
 
         cog_files = sorted(
@@ -94,13 +110,18 @@ def create_bot_instance(token):
 
     @bot.event
     async def on_ready():
+        # We use a local variable here, not global, because each bot has its own state
         nonlocal cogs_loaded
+        
         print(f"✅ Logged in as {bot.user} ({bot.user.id})")
 
+        # Only load cogs once per bot instance
         if not cogs_loaded:
             results = await load_all_cogs()
+
             for result in results:
                 print(result)
+
             cogs_loaded = True
 
         print("🚀 Ready")
@@ -124,7 +145,9 @@ def create_bot_instance(token):
             # Retry once if something failed
             if failed:
                 await asyncio.sleep(1)
+
                 retry = await load_all_cogs()
+
                 results += [
                     "",
                     "──── RETRY ────",
@@ -143,7 +166,9 @@ def create_bot_instance(token):
 
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
+
             print(f"Refresh error: {error}")
+
             try:
                 await msg.edit(
                     content=f"⚠️ Refresh failed: `{error}`"
@@ -158,6 +183,7 @@ def create_bot_instance(token):
     @bot.command(name="ping")
     async def ping(ctx):
         latency = round(bot.latency * 1000)
+
         await ctx.send(
             f"🏓 Pong! `{latency}ms`"
         )
@@ -168,6 +194,7 @@ def create_bot_instance(token):
 
     @bot.event
     async def on_command_error(ctx, error):
+
         # Ignore commands from other users
         if isinstance(error, commands.CheckFailure):
             return
@@ -195,6 +222,7 @@ def create_bot_instance(token):
             return
 
         original = getattr(error, "original", error)
+
         error_text = (
             f"{type(original).__name__}: {original}"
         )
@@ -209,6 +237,7 @@ def create_bot_instance(token):
             await ctx.send(
                 f"⚠️ Error: `{error_text}`"
             )
+
         except Exception:
             pass
 
@@ -224,10 +253,11 @@ def create_bot_instance(token):
 
 
 # ============================================================
-# MAIN LOOP
+# RUN BOT HELPER
 # ============================================================
 
 async def run_bot(bot, token):
+    """Starts a single bot instance"""
     try:
         await bot.start(token)
     except discord.LoginFailure:
@@ -237,36 +267,31 @@ async def run_bot(bot, token):
     except Exception as e:
         print(f"❌ Bot error: {type(e).__name__}: {e}")
 
+
+# ============================================================
+# MAIN
+# ============================================================
+
 async def main():
     print("🚀 Starting Discord clients...")
     
-    if len(TOKENS) == 1:
-        # Single token mode (original behavior)
-        bot = create_bot_instance(TOKENS[0])
-        try:
-            await bot.start(TOKENS[0])
-        except KeyboardInterrupt:
-            print("🛑 Stopped.")
-        except Exception as e:
-            print(f"❌ Fatal: {type(e).__name__}: {e}")
-    else:
-        # Multi token mode
-        bots = []
-        tasks = []
-        for i, token in enumerate(TOKENS, 1):
-            bot = create_bot_instance(token)
-            bots.append(bot)
-            tasks.append(asyncio.create_task(run_bot(bot, token)))
-            print(f"🚀 Starting Bot {i}...")
+    bots = []
+    tasks = []
 
-        # Wait for all bots (or until one crashes/interrupts)
-        try:
-            await asyncio.gather(*tasks)
-        except KeyboardInterrupt:
-            print("🛑 Stopping all bots...")
-            for bot in bots:
-                if bot.is_ready():
-                    await bot.close()
+    for i, token in enumerate(TOKENS, 1):
+        bot = create_bot_instance(token)
+        bots.append(bot)
+        tasks.append(asyncio.create_task(run_bot(bot, token)))
+        print(f"🚀 Starting Bot {i}...")
+
+    # Run all bots concurrently
+    try:
+        await asyncio.gather(*tasks)
+    except KeyboardInterrupt:
+        print("🛑 Stopping all bots...")
+        for bot in bots:
+            if bot.is_ready():
+                await bot.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
