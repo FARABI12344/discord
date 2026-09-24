@@ -24,9 +24,9 @@ CYCLE_HOURS = 5
 DHAKA_TZ = ZoneInfo("Asia/Dhaka")
 
 SCHEDULE_TIMES = (
-    (7, 30),
-    (12, 30),
-    (18, 30),
+    (8, 00),
+    (2, 30),
+    (19, 30),
     (22, 30),
 )
 
